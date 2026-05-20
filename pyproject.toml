@@ -1,0 +1,22 @@
+[project]
+name = "travel-plan-assistant"
+version = "0.1.0"
+description = "AI Travel Planning Assistant Backend"
+authors = [
+    {name = "miumiu"}
+]
+requires-python = "^3.11"
+dependencies = [
+    "fastapi (==0.115.5)",
+    "uvicorn[standard] (==0.32.1)",
+    "anthropic (==0.40.0)",
+    "pydantic (==2.10.3)"
+]
+
+
+[tool.poetry]
+package-mode = false
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
