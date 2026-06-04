@@ -40,6 +40,7 @@ class SpotPlan(BaseModel):
     open_time: str
     ticket: float
     type: str         # indoor | outdoor
+    is_indoor: bool   # normalized indoor/outdoor flag (true for indoor)
     tags: List[str]
     description: str
     nearby_foods: List[FoodRec] = []
@@ -52,6 +53,7 @@ class DayPlan(BaseModel):
     weather: WeatherInfo
     spots: List[SpotPlan]
     reasoning: str
+    is_indoor_outdoor_filter: bool = False  # True when rain → indoor spots were reordered ahead
 
 
 class TripResponse(BaseModel):
