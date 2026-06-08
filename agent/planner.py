@@ -12,10 +12,12 @@ Capability → function map:
   6. 输出 JSON 行程 + 规划意图       → generate_reasoning + to_response
 """
 import json
+import os
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Tuple
 
 from langchain_anthropic import ChatAnthropic
+from langchain_openai import ChatOpenAI
 from langchain_core.output_parsers import JsonOutputParser
 
 from models import (
@@ -39,6 +41,13 @@ from tools.routing import (
 from agent.prompts import PLAN_REASONING_PROMPT
 
 _llm = ChatAnthropic(model="claude-haiku-4-5-20251001", max_tokens=2048)
+
+_llm_ds = ChatOpenAI(
+    base_url="https://api.deepseek.com",
+    api_key=os.getenv("DEEPSEEK_API_KEY"),
+    model="deepseek-v4-flash",
+    streaming=True,
+)
 
 # LCEL chain: prompt → LLM → JSON parser
 _reasoning_chain = PLAN_REASONING_PROMPT | _llm | JsonOutputParser()

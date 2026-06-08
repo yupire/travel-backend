@@ -11,7 +11,9 @@ dependencies = [
     "uvicorn[standard] (==0.32.1)",
     "langchain-anthropic (>=0.3.0)",
     "langchain-core (>=0.3.0)",
-    "pydantic (==2.10.3)"
+    "pydantic (==2.10.3)",
+    "langchain-openai (>=1.2.2,<2.0.0)",
+    "pyjwt[crypto] (>=2.10.0,<3.0.0)"
 ]
 
 
