@@ -1,14 +1,18 @@
-"""QWeather (和风天气) API client — JWT (EdDSA) auth + in-memory cache.
+"""QWeather (和风天气) API 客户端 — JWT (EdDSA) 认证 + 内存缓存
 
-Centralizes all 和风天气 API access. Per docs/技术准备.md, auth is JWT with:
-  - alg = "EdDSA" (Ed25519)
+这是和风天气 API 的统一访问层，负责：
+1. JWT (EdDSA/Ed25519) 签名认证
+2. HTTP 请求封装
+3. 响应数据内存缓存
+
+认证方式（参考 docs/技术准备.md）：
+  - alg = "EdDSA" (Ed25519 签名算法)
   - kid = credential id (QWEATHER_KID)
-  - sub = project id  (QWEATHER_PROJECT_ID)
-  - iat, exp = 15-minute window
+  - sub = project id (QWEATHER_PROJECT_ID)
+  - iat, exp = 15 分钟有效期窗口
 
-Configuration is read from env vars at call time (cached on the key object);
-if QWEATHER_PRIVATE_KEY is missing/blank, ``is_configured()`` returns False and
-callers should fall back to mocks.
+配置通过环境变量读取；如果 QWEATHER_PRIVATE_KEY 未配置，
+is_configured() 返回 False，调用方应降级到 mock 数据。
 """
 from __future__ import annotations
 
@@ -49,43 +53,65 @@ _jwt_expires_at: float = 0.0
 
 
 class QWeatherError(RuntimeError):
-    """Raised on any QWeather API failure (network, HTTP, JSON, missing config)."""
+    """QWeather API 错误异常类
+
+    当以下情况发生时抛出：
+    - 网络请求失败
+    - HTTP 状态码非 200
+    - JSON 解析失败
+    - 业务 code 非 200
+    - 私钥未配置或无效
+    """
 
 
 # ---------------------------------------------------------------------------
-# Configuration
+# 配置读取 (Configuration)
 # ---------------------------------------------------------------------------
 def _private_key_pem() -> str:
-    """Return the raw PEM from env, supporting multi-line values via \\n escapes."""
+    """从环境变量读取 Ed25519 私钥 (PEM 格式)
+
+    支持 .env 文件中用 "\\n" 转义表示换行，方便配置多行私钥。
+    """
     raw = os.getenv("QWEATHER_PRIVATE_KEY", "").strip()
     if not raw:
         return ""
-    # Allow .env users to write literal "\n" instead of real newlines.
+    # 允许 .env 用户用字面量 "\n" 代替真实换行
     return raw.replace("\\n", "\n")
 
 
 def is_configured() -> bool:
-    """True when a non-empty private key is available for signing."""
+    """检查 QWeather 私钥是否已配置
+
+    Returns:
+        bool: 私钥非空返回 True，否则返回 False
+    """
     return bool(_private_key_pem())
 
 
 def host() -> str:
+    """获取 QWeather API 主机地址"""
     return os.getenv("QWEATHER_HOST", _DEFAULT_HOST).rstrip("/")
 
 
 def _project_id() -> str:
+    """获取 QWeather 项目 ID (JWT payload 中的 sub)"""
     return os.getenv("QWEATHER_PROJECT_ID", _DEFAULT_PROJECT_ID)
 
 
 def _kid() -> str:
+    """获取 QWeather 凭证 ID (JWT header 中的 kid)"""
     return os.getenv("QWEATHER_KID", _DEFAULT_KID)
 
 
 # ---------------------------------------------------------------------------
-# JWT (EdDSA) signing
+# JWT (EdDSA) 签名认证
 # ---------------------------------------------------------------------------
 def _load_private_key() -> Any:
-    """Load the Ed25519 private key from PEM, cached after first call."""
+    """加载 Ed25519 私钥（首次调用后缓存）
+
+    Raises:
+        QWeatherError: 私钥未配置、解析失败或密钥类型错误时
+    """
     global _private_key
     if _private_key is not None:
         return _private_key
@@ -107,7 +133,17 @@ def _load_private_key() -> Any:
 
 
 def _build_jwt() -> str:
-    """Return a freshly-signed JWT. Caller must hold _lock."""
+    """生成新签名的 JWT token
+
+    调用者必须持有 _lock。
+
+    JWT 结构：
+    - Header: {"alg": "EdDSA", "kid": credential_id}
+    - Payload: {"sub": project_id, "iat": now, "exp": now + 15min}
+
+    Returns:
+        str: 签名后的 JWT token
+    """
     global _jwt, _jwt_expires_at
     now = int(time.time())
     payload = {
@@ -117,25 +153,42 @@ def _build_jwt() -> str:
     }
     headers = {"alg": "EdDSA", "kid": _kid()}
     key = _load_private_key()
+    # 使用 EdDSA 算法签名生成 JWT
     token = jwt.encode(payload, key, algorithm="EdDSA", headers=headers)
     _jwt = token
+    # 使用 monotonic 时间避免系统时间调整影响，提前 60 秒刷新确保安全
     _jwt_expires_at = time.monotonic() + _JWT_TTL_SECONDS - _JWT_SAFETY_MARGIN
     return token
 
 
 def _get_jwt() -> str:
-    """Return a non-expired JWT, refreshing if needed. Thread-safe."""
+    """获取未过期的 JWT，如需要则自动刷新（线程安全）
+
+    Returns:
+        str: 有效的 JWT token
+    """
     global _jwt, _jwt_expires_at
     with _lock:
+        # JWT 不存在或即将过期时重新生成
         if _jwt is None or time.monotonic() >= _jwt_expires_at:
             return _build_jwt()
         return _jwt
 
 
 # ---------------------------------------------------------------------------
-# Caching
+# 内存缓存 (Caching)
 # ---------------------------------------------------------------------------
 def _cache_get(key: str) -> Optional[Any]:
+    """从内存缓存获取数据
+
+    如果数据已过期，自动删除并返回 None。
+
+    Args:
+        key: 缓存键
+
+    Returns:
+        缓存的值，未命中或过期返回 None
+    """
     with _cache_lock:
         entry = _cache.get(key)
         if not entry:
@@ -148,12 +201,19 @@ def _cache_get(key: str) -> Optional[Any]:
 
 
 def _cache_set(key: str, value: Any, ttl_seconds: float) -> None:
+    """设置内存缓存
+
+    Args:
+        key: 缓存键
+        value: 要缓存的值
+        ttl_seconds: 过期时间（秒）
+    """
     with _cache_lock:
         _cache[key] = (value, time.monotonic() + ttl_seconds)
 
 
 # ---------------------------------------------------------------------------
-# HTTP request
+# HTTP 请求封装 (HTTP request)
 # ---------------------------------------------------------------------------
 def _request(
     path: str,
@@ -161,13 +221,24 @@ def _request(
     *,
     cache_ttl: float = 0.0,
 ) -> Dict[str, Any]:
-    """Authenticated GET against the QWeather API.
+    """向 QWeather API 发起认证的 GET 请求
 
-    Raises QWeatherError on any failure. If ``cache_ttl`` > 0, the parsed JSON
-    response is cached by ``(path, frozenset(params))`` for that many seconds.
+    自动添加 JWT Bearer token，处理错误，支持缓存。
+
+    Args:
+        path: API 路径，如 "/v7/weather/3d"
+        params: URL 查询参数
+        cache_ttl: 缓存时间（秒），0 表示不缓存
+
+    Returns:
+        Dict: 解析后的 JSON 响应
+
+    Raises:
+        QWeatherError: 网络错误、HTTP 错误、JSON 解析错误、业务错误
     """
     if not is_configured():
         raise QWeatherError("QWeather 未配置 QWEATHER_PRIVATE_KEY")
+    # 使用 (path, 参数) 作为缓存键，确保相同请求复用缓存
     cache_key = f"{path}?{frozenset((params or {}).items())}"
     if cache_ttl > 0:
         cached = _cache_get(cache_key)
@@ -175,6 +246,7 @@ def _request(
             return cached
 
     url = f"{host()}{path}"
+    # 添加 JWT Bearer token 认证头
     headers = {"Authorization": f"Bearer {_get_jwt()}"}
     try:
         with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
@@ -191,6 +263,7 @@ def _request(
     except ValueError as e:
         raise QWeatherError(f"QWeather 响应不是合法 JSON {path}: {e}") from e
 
+    # QWeather 业务状态码：200 表示成功
     code = str(data.get("code", ""))
     if code and code != "200":
         raise QWeatherError(

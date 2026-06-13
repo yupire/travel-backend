@@ -1,48 +1,8 @@
-import json
-import os
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Tuple
-
-from langchain_anthropic import ChatAnthropic
-from langchain_openai import ChatOpenAI
-from langchain_core.output_parsers import JsonOutputParser
-
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
 from typing import TypedDict, Annotated
 import operator
 
-from models import (
-    TripRequest,
-    TripResponse,
-    DayPlan,
-    SpotPlan,
-    WeatherInfo,
-    FoodRec,
-    TransportInfo,
-)
-from tools.spots import get_spot_map, geocode_spots
-from tools.weather import get_weather
-from tools.foods import get_top_foods, get_nearby_foods
-from tools.routes import get_popular_routes
-from tools.routing import (
-    reorder_by_weather,
-    add_transport_info,
-    optimize_by_distance_progression,
-)
-from agent.prompts import PLAN_REASONING_PROMPT
-
-# ———————— 定义使用的大模型 ————————
-_llm = ChatAnthropic(model="claude-haiku-4-5-20251001", max_tokens=2048)
-
-_llm_ds = ChatOpenAI(
-    base_url="https://api.deepseek.com",
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    model="deepseek-v4-flash",
-    streaming=True,
-)
-
-# ———————— 定义state ————————
 class TravelState(TypedDict):
     messages: Annotated[list, operator.add]
     retry_count: int
@@ -85,6 +45,24 @@ def _is_complete(state: TravelState) -> bool:
                 if tc["name"] == "generate_itinerary":
                     return True
     return False
+
+
+# ── Agent 节点：带重试计数 ──────────────────────────
+
+def agent_node(state: TravelState) -> dict:
+    try:
+        response = llm.invoke(state["messages"])
+        return {
+            "messages": [response],
+            "retry_count": state["retry_count"]  # 成功了不加
+        }
+    except Exception as e:
+        # LLM 调用本身报错（超时、网络等）
+        return {
+            "messages": [],
+            "retry_count": state["retry_count"] + 1
+        }
+
 
 # ── 降级节点：硬编码流水线 ─────────────────────────
 
@@ -154,8 +132,8 @@ def _build_fallback_output(daily_plans: list) -> dict:
     return {"days": days}
 
 
+# ── 组装 Graph ────────────────────────────────────
 
-# ———————— 定义节点和边 ——————————
 graph = StateGraph(TravelState)
 graph.add_node("agent", agent_node)
 graph.add_node("tools", ToolNode(tools))
@@ -175,16 +153,4 @@ graph.add_conditional_edges(
 graph.add_edge("tools", "agent")
 graph.add_edge("fallback", END)
 
-
 app = graph.compile()
-
-
-# —————— 调用agent推理 ————————
-def plan_trip(request: TripRequest) -> TripResponse:
-
-# 这里的参数用输入的结构化参数
-    return app.invoke({
-    "city": "北京",
-    "dates": ["2024-03-01", "2024-03-02", "2024-03-03"],
-    "days": 3,
-    "messages": []})
