@@ -8,6 +8,7 @@ from tools.weather import get_weather
 from tools.foods import get_top_foods
 from tools.routes import get_popular_routes
 from tools.clusters import cluster_spots_by_geo, export_clusters_to_geojson
+from tools.spot_indoor import classify_spot_indoor, classify_spots_by_city
 from tools.directions import (
     plan_driving_route,
     plan_walking_route,
@@ -183,6 +184,30 @@ def plan_transit_directions(origin: str, destination: str, city: str) -> dict:
 
 
 @tool
+def classify_spot_indoor_outdoor(
+    city: str,
+    spot_names: list = [],
+) -> list:
+    """Classify whether tourist spots in a city are indoor or outdoor.
+
+    Use this when the user mentions weather, rainy day plans, hot sun,
+    "stay indoors" or "outside all day" — you need to know which spots
+    are indoor (museum, mall, gallery, aquarium, theater) and which are
+    outdoor (park, beach, mountain, garden, scenic area).
+
+    Args:
+        city: City name, lowercase (e.g. 'singapore', 'paris', 'beijing').
+        spot_names: Optional list of spot names to filter. If empty,
+            returns the indoor/outdoor classification for ALL spots of the city.
+
+    Returns:
+        list of {"id", "name", "is_indoor", "type"} for each matched spot.
+        "type" is "indoor" or "outdoor".
+    """
+    return classify_spots_by_city(city, spot_names or None)
+
+
+@tool
 def plan_route_directions(origin: str, destination: str, mode: str, city: str = "") -> dict:
     """Universal route planning tool supporting multiple transportation modes.
 
@@ -218,4 +243,5 @@ ALL_TOOLS = [
     plan_electrobike_directions,
     plan_transit_directions,
     plan_route_directions,
+    classify_spot_indoor_outdoor,
 ]
