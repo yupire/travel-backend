@@ -5,6 +5,8 @@ from fastapi import APIRouter, HTTPException
 from models import TripRequest, TripResponse
 from agent import plan_trip
 from tools.cities import get_cities,get_city
+from tools import weather
+from tools.spots import get_spot_map
 
 router = APIRouter()
 
@@ -48,3 +50,14 @@ def create_plan(request: TripRequest):
 @router.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# 外部api调用
+@router.get("/weather")
+def get_weather(city: str, date: str):
+    print(f"API 请求天气 city={city} date={date}")
+    return weather.get_weather(city, date)   
+
+@router.get("/spots")
+def get_spots(city: str, limit: int = 10):
+    return get_spot_map(city)

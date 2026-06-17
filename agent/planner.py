@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from typing import Annotated, TypedDict
 
+import logging
 import operator
 import os
 
@@ -43,6 +44,13 @@ from langgraph.prebuilt import ToolNode
 from models import TripRequest, TripResponse
 from tools import ALL_TOOLS
 from agent.prompts import PLAN_REASONING_PROMPT, build_initial_messages
+
+
+# ──────────────────────── 日志 ────────────────────────
+# 模块级 logger，命名为 "agent.planner"，便于在外层统一配置 handler / level。
+# 这里只取 logger，不调用 basicConfig —— 由应用入口决定日志输出格式与级别，
+# 避免库代码抢占根 logger 配置。
+logger = logging.getLogger(__name__)
 
 
 # ──────────────────────── 大模型 ────────────────────────
@@ -96,9 +104,14 @@ class TravelState(TypedDict):
 # ──────────────────────── 节点定义 ────────────────────────
 def agent_node(state: TravelState) -> dict:
     """节点 2：调用 LLM 进行逻辑推理，决定调用工具或输出最终结果。"""
+    retry = state.get("retry_count", 0)
+    logger.info("进入 agent_node：city=%s, 历史消息数=%d, 当前重试=%d",
+                state.get("city"), len(state.get("messages") or []), retry)
+
     # 如果 messages 为空，调用 prompts.py 中的工厂函数注入系统提示与用户问题
     messages = state.get("messages") or []
     if not messages:
+        logger.debug("messages 为空，构造初始系统提示 + 用户问题")
         messages = build_initial_messages(
             city=state["city"],
             dates=state["dates"],
@@ -106,18 +119,27 @@ def agent_node(state: TravelState) -> dict:
         )
 
     try:
+        # 调用绑定了工具的主链：LLM 自行决定是直接回答还是产生 tool_calls
         response = _llm.invoke(messages)
+        # 记录本轮 LLM 是否要求调用工具，便于排查 Graph 走向
+        tool_calls = getattr(response, "tool_calls", None) or []
+        logger.info("agent_node LLM 返回：tool_calls=%d", len(tool_calls))
+        if tool_calls:
+            logger.debug("LLM 请求的工具：%s",
+                         [tc.get("name") for tc in tool_calls])
         return {
             "messages": [response],
-            "retry_count": state.get("retry_count", 0),
+            "retry_count": retry,
         }
     except Exception as e:
         # LLM 本身异常（超时/限流等），让路由函数走降级
+        logger.exception("agent_node LLM 调用异常，retry_count -> %d：%r",
+                         retry + 1, e)
         return {
             "messages": [
                 SystemMessage(content=f"[agent_node error] {e!r}"),
             ],
-            "retry_count": state.get("retry_count", 0) + 1,
+            "retry_count": retry + 1,
         }
 
 
@@ -127,19 +149,27 @@ def reasoning_node(state: TravelState) -> dict:
     之所以单独拆出来，是因为 agent_node 绑了工具后，模型有可能不再愿意纯文本输出；
     拆出一个无工具的 LLM 专门负责把数据渲染成中文 reasoning / summary。
     """
+    daily_plans = state.get("daily_plans", [])
+    logger.info("进入 reasoning_node：city=%s, daily_plans 天数=%d",
+                state.get("city"), len(daily_plans))
+
+    # 用「提示词模板 | 无工具 LLM」拼成的链，把工具产出的结构化数据渲染为中文文案
     chain = PLAN_REASONING_PROMPT | _reasoning_llm
     response = chain.invoke({
         "city": state["city"],
         "start_date": state["dates"][0],
         "end_date": state["dates"][-1],
-        "days_json": str(state.get("daily_plans", [])),
+        "days_json": str(daily_plans),
     })
+    logger.info("reasoning_node 完成自然语言生成")
     return {"messages": [response]}
 
 
 def fallback_node(state: TravelState) -> dict:
     """降级节点：LLM 多次失败时，硬编码用模板生成（不依赖 LLM）。"""
     daily_plans = state.get("daily_plans") or []
+    logger.warning("进入 fallback_node（降级路径）：city=%s, daily_plans 天数=%d",
+                   state.get("city"), len(daily_plans))
     days = []
     for i, plan in enumerate(daily_plans, start=1):
         w = plan.get("weather", {})
@@ -162,6 +192,7 @@ def fallback_node(state: TravelState) -> dict:
         "itinerary": days,
         "summary": "（降级输出：未经过 LLM 推理生成，仅使用工具数据 + 模板）",
     }
+    logger.warning("fallback_node 模板生成完成：共 %d 天行程", len(days))
     return {
         "is_fallback": True,
         "messages": [SystemMessage(content=str(result))],
@@ -182,25 +213,32 @@ def should_continue(state: TravelState) -> str:
     - END            → 直接结束
     """
     # 1) 重试次数超限：直接降级
-    if state.get("retry_count", 0) >= MAX_RETRY:
+    retry = state.get("retry_count", 0)
+    if retry >= MAX_RETRY:
+        logger.warning("should_continue: 重试次数 %d 已达上限 %d -> fallback",
+                       retry, MAX_RETRY)
         return "fallback"
 
     messages = state.get("messages") or []
     if not messages:
+        logger.warning("should_continue: messages 为空 -> fallback")
         return "fallback"
 
     last = messages[-1]
 
     # 2) 最后一轮是工具返回（ToolMessage），让 LLM 接着看结果
     if getattr(last, "type", "") == "tool":
+        logger.debug("should_continue: 最后一条是工具结果 -> agent")
         return "agent"
 
     # 3) LLM 决定调用工具 → 走 tools 节点
     tool_calls = getattr(last, "tool_calls", None)
     if tool_calls:
+        logger.info("should_continue: LLM 请求 %d 个工具 -> tools", len(tool_calls))
         return "tools"
 
     # 4) LLM 没有 tool_calls，且没异常 → 进入 reasoning 节点生成自然语言
+    logger.info("should_continue: LLM 无工具调用 -> reasoning")
     return "reasoning"
 
 
@@ -243,13 +281,19 @@ def plan_trip(request: TripRequest) -> TripResponse:
     """调用 Agent，串行触发整个 Graph，返回结构化 TripResponse。"""
     from datetime import datetime, timedelta
 
+    logger.info("plan_trip 开始：city=%s, %s ~ %s",
+                request.city, request.start_date, request.end_date)
+
+    # 把起止日期展开成逐日列表（含首尾），供各节点按天处理
     start = datetime.fromisoformat(request.start_date)
     end = datetime.fromisoformat(request.end_date)
     dates = [
         (start + timedelta(days=i)).date().isoformat()
         for i in range((end - start).days + 1)
     ]
+    logger.info("plan_trip 行程共 %d 天", len(dates))
 
+    # 同步触发整个 Graph：从 START -> agent，循环工具调用直到 reasoning/fallback
     final_state = app.invoke({
         "city": request.city,
         "dates": dates,
@@ -262,6 +306,10 @@ def plan_trip(request: TripRequest) -> TripResponse:
         "clusters": {},
         "daily_plans": [],
     })
+
+    logger.info("Graph 执行结束：is_fallback=%s, 最终消息数=%d",
+                final_state.get("is_fallback"),
+                len(final_state.get("messages", [])))
 
     # 从最后一条 assistant 消息中提取 JSON 字符串
     import json
@@ -276,8 +324,12 @@ def plan_trip(request: TripRequest) -> TripResponse:
         )
 
     try:
+        # 正常路径：最后一条消息体本身就是结构化 JSON
         payload = json.loads(content)
+        logger.info("plan_trip 成功解析 JSON 输出")
     except (TypeError, ValueError):
+        # 兜底：最后一条不是合法 JSON（如 reasoning 纯文本/异常），构造最小结构返回
+        logger.warning("plan_trip 无法解析为 JSON，使用兜底结构返回 summary")
         payload = {
             "city": request.city,
             "start_date": request.start_date,

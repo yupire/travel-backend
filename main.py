@@ -1,5 +1,12 @@
+import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+# 配置日志：INFO 级别，输出到控制台（uvicorn 会自动捕获）
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+)
 
 # Load .env on startup so QWEATHER_* and DEEPSEEK_API_KEY are visible to os.getenv().
 # python-dotenv is shipped transitively by pydantic/uvicorn; if unavailable we
