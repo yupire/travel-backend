@@ -36,6 +36,7 @@ import os
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage
+from langchain_core.utils import convert_to_secret_str
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
 
@@ -45,27 +46,29 @@ from agent.prompts import PLAN_REASONING_PROMPT, build_initial_messages
 
 
 # ──────────────────────── 大模型 ────────────────────────
-# Agent 主链：（通过 OpenAI 兼容接口），带工具调用能力
+# Agent 主链：调用 （OpenAI 兼容协议），带工具调用能力
+# 对应 OpenAI SDK 用法（参见 https://api-docs.deepseek.com）：
+#   client = OpenAI(api_key=os.environ["DEEPSEEK_API_KEY"], base_url="https://api.deepseek.com")
+#   client.chat.completions.create(model="deepseek-v4-pro", ...)
 _llm = ChatOpenAI(
-    base_url="https://api.",
-    api_key=os.getenv(""),
-    model="",
+    base_url="https://api.deepseek.com",
+    api_key=os.getenv("DEEPSEEK_API_KEY"),
+    model="deepseek-v4-pro",
     streaming=False,
     reasoning_effort="high",
     # 透传 OpenAI SDK 不直接支持的字段（如 thinking）
     model_kwargs={"extra_body": {"thinking": {"type": "enabled"}}},
 ).bind_tools(ALL_TOOLS)
 
-# 用于最终生���自然语言 reasoning/summary 的 LLM（无工具绑定）
+# 用于最终生成自然语言 reasoning/summary 的 LLM（无工具绑定）
 _reasoning_llm = ChatOpenAI(
-    base_url="https://api.",
-    api_key=os.getenv(""),
-    model="",
+    base_url="https://api.deepseek.com",
+    api_key=os.getenv("DEEPSEEK_API_KEY"),
+    model="deepseek-v4-pro",
     streaming=False,
     reasoning_effort="high",
     model_kwargs={"extra_body": {"thinking": {"type": "enabled"}}},
 )
-
 
 # ──────────────────────── State ────────────────────────
 class TravelState(TypedDict):

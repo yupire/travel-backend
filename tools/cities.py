@@ -27,13 +27,13 @@ _CITIES_TTL_SECONDS = 24 * 60 * 60
 _SEED_QUERIES = [
     "北京", "上海", "广州", "深圳", "成都", "杭州", "西安", "重庆", "厦门", "青岛",
     "香港", "澳门", "台北",
-    "东京", "大阪", "京都", "札幌", "奈良", "横滨",
-    "首尔", "釜山",
-    "曼谷", "清迈", "普吉", "新加坡",
-    "巴黎", "伦敦", "罗马", "米兰", "巴塞罗那", "马德里", "柏林", "阿姆斯特丹",
-    "纽约", "洛杉矶", "旧金山", "芝加哥", "华盛顿",
-    "悉尼", "墨尔本", "奥克兰",
-    "迪拜", "伊斯坦布尔",
+    # "东京", "大阪", "京都", "札幌", "奈良", "横滨",
+    # "首尔", "釜山",
+    # "曼谷", "清迈", "普吉", "新加坡",
+    # "巴黎", "伦敦", "罗马", "米兰", "巴塞罗那", "马德里", "柏林", "阿姆斯特丹",
+    # "纽约", "洛杉矶", "旧金山", "芝加哥", "华盛顿",
+    # "悉尼", "墨尔本", "奥克兰",
+    # "迪拜", "伊斯坦布尔",
 ]
 
 # 线程锁，用于保护城市列表缓存的并发访问
@@ -110,6 +110,48 @@ def _fetch_all_cities() -> List[Dict]:
     # 按国家分组可以让前端下拉列表更易浏览
     return sorted(seen.values(), key=lambda c: (c["country"], c["name"], c["id"]))
 
+
+def get_city(location: str) -> Dict:
+    """根据城市名称查询单个城市数据。
+
+    该方法直接调用和风天气 /geo/v2/city/lookup 接口，查询指定名称的城市。
+    返回第一个匹配的城市数据，包含 id/name/country/lat/lng 等字段。
+    如果查询失败或未找到匹配的城市，抛出 QWeatherError 异常。
+
+    Args:
+        location: 城市名称，如 "北京"、"Tokyo"、"New York"
+
+    Returns:
+        Dict: 城市数据，包含 id/name/country/lat/lng 等字段
+
+    Raises:
+        QWeatherError: 当查询失败或未找到匹配的城市时抛出
+    """
+    try:
+        data = _request(
+            "/geo/v2/city/lookup",
+            params={"location": location, "range": "cn" if any("一" <= ch <= "鿿" for ch in location) else "world", "number": 1, "lang": "zh"},
+            cache_ttl=0,  # 不使用缓存，实时查询
+        )
+    except QWeatherError as e:
+        raise QWeatherError(f"查询城市 {location} 失败：{e}")
+
+    locations = data.get("location", [])
+    if not locations:
+        raise QWeatherError(f"未找到匹配的城市：{location}")
+
+    item = locations[0]
+    return {
+        "id": item.get("id"),
+        "name": item.get("name"),
+        "name_en": item.get("name"),  # API 暂未提供英文名，复用 name
+        "country": item.get("country"),
+        "lat": float(item.get("lat", 0.0) or 0.0),
+        "lng": float(item.get("lon", 0.0) or 0.0),
+        "adm1": item.get("adm1", ""),
+        "adm2": item.get("adm2", ""),
+        "fx_link": item.get("fxLink", ""),
+    }
 
 def get_cities() -> List[Dict]:
     """获取城市列表（带缓存）。

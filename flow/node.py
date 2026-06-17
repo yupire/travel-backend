@@ -1,10 +1,19 @@
-from langchain_anthropic import ChatAnthropic
+import os
+
+from langchain_openai import ChatOpenAI
 from tool import search_pois, get_weather, cluster_pois, get_route, TravelState
 from langchain_core.messages import SystemMessage, HumanMessage
 
 # 定义graph节点和路由逻辑
 
-llm = ChatAnthropic(model="claude-opus-4-5").bind_tools(
+llm = ChatOpenAI(
+    base_url="https://api.deepseek.com",
+    api_key=os.getenv("DEEPSEEK_API_KEY"),
+    model="deepseek-v4-pro",
+    streaming=False,
+    reasoning_effort="high",
+    model_kwargs={"extra_body": {"thinking": {"type": "enabled"}}},
+).bind_tools(
     [search_pois, get_weather, cluster_pois, get_route]
 )
 

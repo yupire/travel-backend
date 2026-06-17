@@ -1,9 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from router import router
-
-# Load .env on startup so QWEATHER_* and * are visible to os.getenv().
+# Load .env on startup so QWEATHER_* and DEEPSEEK_API_KEY are visible to os.getenv().
 # python-dotenv is shipped transitively by pydantic/uvicorn; if unavailable we
 # fall back to a no-op so the app still starts.
 try:
@@ -11,6 +9,17 @@ try:
     load_dotenv(find_dotenv(filename=".env", usecwd=True), override=False)
 except Exception:  # pragma: no cover - dotenv missing is non-fatal
     pass
+
+# ChatOpenAI / openai SDK will fall back to OPENAI_API_KEY if no api_key
+# is passed in. Mirror the LLM-provider key into OPENAI_API_KEY so the
+# client construction in agent/planner.py does not need to be touched.
+_LLM_KEY = "DEEPSEEK_API_KEY"
+import os as _os
+_ds = _os.getenv(_LLM_KEY)
+if _ds and not _os.getenv("OPENAI_API_KEY"):
+    _os.environ["OPENAI_API_KEY"] = _ds
+
+from router import router
 
 app = FastAPI(title="AI Travel Agent", version="2.0.0")
 

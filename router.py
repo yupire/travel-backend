@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException
 
 from models import TripRequest, TripResponse
 from agent import plan_trip
-from tools.cities import get_cities
+from tools.cities import get_cities,get_city
 
 router = APIRouter()
 
@@ -14,6 +14,12 @@ router = APIRouter()
 def list_cities():
     """Mock: list of supported cities."""
     return {"cities": get_cities()}
+
+# 查询单个城市
+@router.get("/cities/{location}")
+def list_cities(location:str):
+    """Mock: list of supported cities."""
+    return {"cities": get_city(location)}
 
 
 # 生成行程
