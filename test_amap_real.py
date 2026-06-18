@@ -79,16 +79,16 @@ print(f"  返回 {len(spots_chengdu)} 个景点")
 for i, s in enumerate(spots_chengdu, 1):
     print(f"    {i}. {s.get('name')} | {s.get('type')}")
 
-print("\n【2】国际城市景点测试（应降级到 Mock）")
+print("\n【2】国际城市景点测试（非中国城市应返回空列表）")
 print("  —— 东京 ——")
 spots_tokyo = get_top_spots('Tokyo', 3)
-print(f"  返回 {len(spots_tokyo)} 个景点 (Mock)")
+print(f"  返回 {len(spots_tokyo)} 个景点")
 for i, s in enumerate(spots_tokyo[:2], 1):
     print(f"    {i}. {s.get('name')} ({s.get('name_en')})")
 
 print("\n  —— 巴黎 ——")
 spots_paris = get_top_spots('paris', 2)
-print(f"  返回 {len(spots_paris)} 个景点 (Mock)")
+print(f"  返回 {len(spots_paris)} 个景点")
 for i, s in enumerate(spots_paris, 1):
     print(f"    {i}. {s.get('name')} ({s.get('name_en')})")
 

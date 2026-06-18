@@ -1,16 +1,13 @@
-"""美食查询工具 — 高德地图 POI API + Mock 降级
+"""美食查询工具 — 高德地图 POI API
 
-该模块提供美食查询功能，优先调用高德地图 /v5/place/text API，
-失败时降级到 mock_data.json 的本地数据。
+该模块提供美食查询功能，调用高德地图 /v5/place/text API。
 
 支持：
 - 中国城市（含港澳）→ 高德真实数据
-- 国际城市 → Mock 数据
-- API Key 未配置/网络错误 → Mock 降级
+- 非中国城市 / API Key 未配置 / 网络错误 → 返回空列表
 """
 from __future__ import annotations
 
-import json
 import logging
 import math
 import os
@@ -45,28 +42,12 @@ except ImportError:
 
 log = logging.getLogger(__name__)
 
-# Mock 数据路径
-_DATA_PATH = os.path.join(os.path.dirname(__file__), "../data/mock_data.json")
-
 # 缓存时间：24 小时（美食数据相对稳定）
 _FOODS_TTL_SECONDS = 24 * 60 * 60
 
 # 高德 POI 类型编码：餐饮服务
 # 参考: https://lbs.amap.com/api/webservice/guide/api/search#poi_type_code
 _FOOD_TYPES = "050000|050101|050102|050103|050104|050105|050107|050108|050109|050110|050111|050112|050118"
-
-# 加载 mock 数据
-def _load_mock_foods() -> Dict[str, List[Dict]]:
-    """加载 mock_data.json 中的美食数据"""
-    try:
-        with open(_DATA_PATH, encoding="utf-8") as f:
-            return json.load(f)["foods"]
-    except Exception as e:
-        log.error("加载 mock_data.json 失败: %s", e)
-        return {}
-
-
-_MOCK_FOODS_DB = _load_mock_foods()
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +130,8 @@ def _fetch_foods_from_amap(city: str, limit: int = 20) -> List[Dict]:
     page_size = 20
     pages = (limit + page_size - 1) // page_size
 
+    log.info("开始从高德 API 获取美食: city=%s, region=%s, limit=%d, pages=%d", city, region, limit, pages)
+
     all_foods = []
     for page in range(1, pages + 1):
         try:
@@ -172,6 +155,7 @@ def _fetch_foods_from_amap(city: str, limit: int = 20) -> List[Dict]:
             break
 
         pois = data.get("pois", [])
+        log.info("高德 API 第 %d 页返回 %d 条 POI", page, len(pois))
         if not pois:
             break
 
@@ -186,7 +170,9 @@ def _fetch_foods_from_amap(city: str, limit: int = 20) -> List[Dict]:
         if len(all_foods) >= limit:
             break
 
-    return all_foods[:limit]
+    result = all_foods[:limit]
+    log.info("高德 API 获取美食完成: city=%s, 共 %d 条", city, len(result))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +182,7 @@ def _fetch_foods_from_amap(city: str, limit: int = 20) -> List[Dict]:
 def get_top_foods(city: str, limit: int = 20) -> List[Dict]:
     """获取城市热门美食列表
 
-    优先使用高德真实数据，失败时降级到 mock。
+    使用高德真实数据。非中国城市 / API 未配置 / 获取失败时返回空列表。
 
     Args:
         city: 城市名称（中文或拼音）
@@ -206,20 +192,20 @@ def get_top_foods(city: str, limit: int = 20) -> List[Dict]:
         List[Dict]: 美食列表
     """
     cache_key = f"foods:{city}:{limit}"
+    log.info("查询城市热门美食: city=%s, limit=%d", city, limit)
 
     # 检查缓存
     cached = _cache_get(cache_key)
     if cached is not None:
+        log.info("命中缓存: %s，返回 %d 条美食", cache_key, len(cached))
         return cached
 
-    # 判断是否为中国城市
+    # 判断是否为中国城市（高德仅覆盖中国城市）
     if not is_chinese_city(city):
-        log.info("非中国城市 %s，使用 mock 美食数据", city)
-        foods = _MOCK_FOODS_DB.get(city.lower(), [])[:limit]
-        _cache_set(cache_key, foods, _FOODS_TTL_SECONDS)
-        return foods
+        log.info("非中国城市 %s，无美食数据，返回空列表", city)
+        return []
 
-    # 尝试从高德获取
+    # 从高德获取
     if is_configured():
         try:
             foods = _fetch_foods_from_amap(city, limit)
@@ -227,16 +213,14 @@ def get_top_foods(city: str, limit: int = 20) -> List[Dict]:
                 _cache_set(cache_key, foods, _FOODS_TTL_SECONDS)
                 return foods
             else:
-                log.warning("高德 API 返回空结果，降级到 mock")
+                log.warning("高德 API 返回空结果: city=%s", city)
         except AMapError as e:
-            log.warning("高德 API 获取失败: %s，降级到 mock", e)
+            log.warning("高德 API 获取失败: city=%s err=%s", city, e)
     else:
-        log.info("AMAP_KEY 未配置，使用 mock 美食数据")
+        log.info("AMAP_KEY 未配置，无法获取美食数据")
 
-    # 降级到 mock
-    foods = _MOCK_FOODS_DB.get(city.lower(), [])[:limit]
-    _cache_set(cache_key, foods, _FOODS_TTL_SECONDS)
-    return foods
+    log.info("get_top_foods 返回空列表: city=%s", city)
+    return []
 
 
 def get_nearby_foods(spot: Dict, city_foods: List[Dict], limit: int = 4) -> List[Dict]:
@@ -252,6 +236,11 @@ def get_nearby_foods(spot: Dict, city_foods: List[Dict], limit: int = 4) -> List
     Returns:
         List[Dict]: 美食列表，每个包含距离信息
     """
+    log.info(
+        "查询景点附近美食: spot=%s, 候选美食 %d 条, limit=%d",
+        spot.get("name", spot.get("id", "?")), len(city_foods), limit,
+    )
+
     scored = [
         (f, _haversine_m(spot["lat"], spot["lng"], f["lat"], f["lng"]))
         for f in city_foods
@@ -268,4 +257,9 @@ def get_nearby_foods(spot: Dict, city_foods: List[Dict], limit: int = 4) -> List
             "rating": food.get("rating", 4.0),
             "distance_m": dist,
         })
+    log.info(
+        "景点附近美食推荐完成: spot=%s, 返回 %d 条, 最近 %dm",
+        spot.get("name", spot.get("id", "?")), len(result),
+        result[0]["distance_m"] if result else -1,
+    )
     return result

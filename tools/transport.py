@@ -2,7 +2,7 @@ from typing import Dict
 
 
 def get_transport(distance_km: float) -> Dict:
-    """Mock: returns transport mode and info based on distance."""
+    """根据距离估算交通方式与信息（基于距离区间的启发式估算）。"""
     if distance_km < 0.8:
         return {
             "mode": "步行",

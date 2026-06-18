@@ -12,7 +12,7 @@
   - iat, exp = 15 分钟有效期窗口
 
 配置通过环境变量读取；如果 QWEATHER_PRIVATE_KEY 未配置，
-is_configured() 返回 False，调用方应降级到 mock 数据。
+is_configured() 返回 False，调用方应返回空结果（None）。
 """
 from __future__ import annotations
 

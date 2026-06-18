@@ -2,14 +2,14 @@
 """测试高德地图 API 集成
 
 验证：
-1. Mock 降级功能（无 API Key 时）
+1. 无 API Key 时返回空列表
 2. 城市判断逻辑
 3. 数据格式兼容性
 """
 import sys
 import os
 
-# 确保没有 API Key，强制使用 mock
+# 确保没有 API Key（未配置时应返回空列表）
 os.environ['AMAP_API_KEY'] = ''
 
 # 直接执行模块代码（绕过 tools/__init__.py）
@@ -72,7 +72,7 @@ print(f"  is_chinese_city('Tokyo'): {is_chinese_city('Tokyo')}")
 print(f"  normalize_city_name('beijing'): {normalize_city_name('beijing')}")
 print(f"  normalize_city_name('北京市'): {normalize_city_name('北京市')}")
 
-print("\n【2】景点查询测试（Mock 降级）")
+print("\n【2】景点查询测试（无 Key 应返回空列表）")
 spots_beijing = get_top_spots("beijing", 5)
 print(f"  get_top_spots('beijing', 5) → {len(spots_beijing)} 个景点")
 if spots_beijing:
@@ -97,7 +97,7 @@ print(f"  geocode_spots('beijing', ['故宫', '颐和园', '不存在的景点']
 for g in geocoded:
     print(f"    {g.get('name')}: lat={g.get('lat')}, lng={g.get('lng')}")
 
-print("\n【5】美食查询测试（Mock 降级）")
+print("\n【5】美食查询测试（无 Key 应返回空列表）")
 foods_beijing = get_top_foods("beijing", 3)
 print(f"  get_top_foods('beijing', 3) → {len(foods_beijing)} 个美食")
 if foods_beijing:

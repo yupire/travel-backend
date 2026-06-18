@@ -6,7 +6,6 @@ from tools.cities import get_cities
 from tools.spots import get_top_spots, geocode_spots
 from tools.weather import get_weather
 from tools.foods import get_top_foods
-from tools.routes import get_popular_routes
 from tools.clusters import cluster_spots_by_geo, export_clusters_to_geojson
 from tools.spot_indoor import classify_spot_indoor, classify_spots_by_city
 from tools.directions import (
@@ -52,12 +51,6 @@ def get_city_weather(city: str, date: str) -> dict:
 def get_food_recommendations(city: str, limit: int = 10) -> list:
     """Get top food and restaurant recommendations for a city."""
     return get_top_foods(city, limit)
-
-
-@tool
-def get_trip_routes(city: str, days: int) -> list:
-    """Get popular pre-planned spot sequences for a city trip of N days. Returns spot IDs per day."""
-    return get_popular_routes(city, days)
 
 
 @tool
@@ -174,7 +167,8 @@ def plan_transit_directions(origin: str, destination: str, city: str) -> dict:
     Args:
         origin: Starting point coordinate as "lng,lat" (longitude first)
         destination: Ending point coordinate as "lng,lat" (longitude first)
-        city: City name for transit planning (required for citycode parameter)
+        city: Chinese city name (e.g. "北京", "上海") or Amap adcode. Transit
+            planning only supports cities in mainland China.
 
     Returns:
         dict with origin, destination, total distance, and transits list.
@@ -215,7 +209,8 @@ def plan_route_directions(origin: str, destination: str, mode: str, city: str = 
         origin: Starting point coordinate as "lng,lat" (longitude first)
         destination: Ending point coordinate as "lng,lat" (longitude first)
         mode: Transportation mode: "driving", "walking", "bicycling", "electrobike", or "transit"
-        city: City name (required for transit mode, optional for others)
+        city: Chinese city name or Amap adcode (required for transit mode,
+            ignored for others). Transit only supports mainland China cities.
 
     Returns:
         dict with route details depending on the mode (distance, duration, steps, segments, etc.)
@@ -234,7 +229,6 @@ ALL_TOOLS = [
     geocode_spot_locations,
     get_city_weather,
     get_food_recommendations,
-    get_trip_routes,
     cluster_spots_geographically,
     export_clusters_geojson,
     plan_driving_directions,

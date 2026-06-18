@@ -16,6 +16,7 @@ import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
+from tools.cities import get_city
 from tools.qweather import QWeatherError, _request
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,57 @@ _FORECAST_DAYS = "7d"
 _weather_cache: Dict[Tuple[str, str], Tuple[Dict, float]] = {}
 _weather_lock = threading.Lock()
 
+# 城市名 → QWeather LocationID 的解析缓存（进程级），避免重复 geo 查询。
+_location_id_cache: Dict[str, str] = {}
+_location_lock = threading.Lock()
+
+
+def _is_location_id_or_coords(value: str) -> bool:
+    """判断字符串是否已经是 QWeather 可直接使用的 location。
+
+    QWeather /v7/weather 的 location 仅接受：
+      - 数字 LocationID（如 "101280101"）
+      - "lng,lat" 经纬度坐标（如 "113.27,23.13"）
+    城市名（如 "guangzhou"、"广州"）会被接口判为 400 Invalid Parameter。
+    """
+    stripped = value.replace(",", "").replace(".", "").replace("-", "")
+    return stripped.isdigit() and stripped != ""
+
+
+def _resolve_location(city: str) -> Optional[str]:
+    """把 agent 传入的城市标识解析成 QWeather 可用的 location。
+
+    - 已经是 LocationID / 经纬度坐标 → 原样返回；
+    - 是城市名（拼音/中文/英文）→ 通过 /geo/v2/city/lookup 解析为 LocationID（带缓存）；
+    - 解析失败 → 返回 None，由上层按"工具失败"处理。
+    """
+    if not city:
+        return None
+    c = city.strip()
+    if _is_location_id_or_coords(c):
+        return c
+
+    key = c.lower()
+    with _location_lock:
+        cached = _location_id_cache.get(key)
+    if cached:
+        return cached
+
+    try:
+        info = get_city(c)
+    except QWeatherError as e:
+        logger.warning("天气定位解析失败 city=%s：%s", city, e)
+        return None
+    loc_id = info.get("id")
+    if not loc_id:
+        logger.warning("天气定位解析无结果 city=%s", city)
+        return None
+    with _location_lock:
+        _location_id_cache[key] = loc_id
+    logger.info("天气定位解析成功 city=%s -> LocationID=%s（%s）",
+                city, loc_id, info.get("name"))
+    return loc_id
+
 
 # ---------------------------------------------------------------------------
 # QWeather 真实 API 调用 (Real API)
@@ -43,14 +95,15 @@ def _fetch_forecast(city_id: str) -> List[Dict]:
     Returns:
         List[Dict]: 多天的每日预报数据列表
     """
-    logger.info("QWeather 预报请求 city=%s", city_id)
+    logger.info("QWeather 预报请求 location=%s", city_id)
     data = _request(
         f"/v7/weather/{_FORECAST_DAYS}",
         params={"location": city_id, "lang": "zh"},
         cache_ttl=_WEATHER_TTL_SECONDS,
     )
-    logger.info("QWeather 预报获取成功 city=%s: %s", city_id)
-    return data.get("daily", [])
+    dailies = data.get("daily", [])
+    logger.info("QWeather 预报获取成功 location=%s，天数=%d", city_id, len(dailies))
+    return dailies
 
 
 def _text_to_condition(text_day: str) -> str:
@@ -115,11 +168,16 @@ def _real_weather(city_id: str, date: str) -> Optional[Dict]:
     Returns:
         Optional[Dict]: 成功返回天气信息，失败返回 None
     """
+    # 关键修复：先把城市名解析成 QWeather LocationID，否则接口返回 400。
+    location = _resolve_location(city_id)
+    if not location:
+        logger.warning("天气：无法将 city=%s 解析为 QWeather LocationID，跳过", city_id)
+        return None
     try:
-        dailies = _fetch_forecast(city_id)
-        logger.info("QWeather 预报获取成功 city=%s, dailies=%s", city_id)
+        dailies = _fetch_forecast(location)
     except QWeatherError as e:
-        logger.warning("QWeather 预报获取失败 city=%s：%s", city_id, e)
+        logger.warning("QWeather 预报获取失败 city=%s（location=%s）：%s",
+                       city_id, location, e)
         return None
     for d in dailies:
         if d.get("fxDate") == date:

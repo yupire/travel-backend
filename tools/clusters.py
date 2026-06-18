@@ -139,13 +139,26 @@ def cluster_spots_by_geo(
             spot_ids     [str]
             spot_names   [str]
     """
+    # 逻辑流程：
+    #   1. 过滤掉缺失经纬度的无效景点；
+    #   2. 调用 DBSCAN（优先 sklearn，失败/缺失则降级纯 Python）得到每点的簇标签；
+    #   3. 把标签为 -1 的噪声点按 eps 邻域连通性再拆成地理相邻的子簇；
+    #   4. 过滤孤点（size < 2），计算每簇质心 / 覆盖半径 / 室内外数量；
+    #   5. 按 size 降序排序后返回（噪声簇置于最后）。
+    log.info("开始地理聚类: 输入 %d 个景点, eps_km=%.2f, min_samples=%d",
+             len(spots), eps_km, min_samples)
+
     if not spots:
         return []
 
     # 过滤无效坐标
     valid_spots = [s for s in spots if s.get("lat") is not None and s.get("lng") is not None]
     if not valid_spots:
+        log.warning("无有效坐标景点，聚类结果为空")
         return []
+    if len(valid_spots) < len(spots):
+        log.debug("过滤掉 %d 个缺失坐标的景点，剩余 %d 个",
+                  len(spots) - len(valid_spots), len(valid_spots))
 
     coords = [[s["lat"], s["lng"]] for s in valid_spots]
 
@@ -153,6 +166,7 @@ def cluster_spots_by_geo(
         coords_rad = [[math.radians(c[0]), math.radians(c[1])] for c in coords]
         try:
             labels = _dbscan_sklearn(coords_rad, eps_km, min_samples)
+            log.debug("使用 sklearn DBSCAN 完成聚类")
         except Exception as e:
             log.warning("sklearn DBSCAN 失败，降级到纯 Python 实现: %s", e)
             labels = _dbscan_python(coords, eps_km, min_samples)
@@ -164,6 +178,8 @@ def cluster_spots_by_geo(
     clusters: Dict[int, List[Dict]] = {}
     for spot, lbl in zip(valid_spots, labels):
         clusters.setdefault(int(lbl), []).append(spot)
+    log.debug("DBSCAN 原始分组: %d 个簇, 噪声点 %d 个",
+              len([k for k in clusters if k >= 0]), len(clusters.get(-1, [])))
 
     # DBSCAN 把"邻居不足"的点全标 -1，但它们可能分布在完全不同的城市。
     # 这里按 eps 邻域连通性把 -1 组再拆成子组，让下游拿到的是真正地理相邻的簇。
@@ -192,6 +208,7 @@ def cluster_spots_by_geo(
                         queue.append(j)
             clusters[sub_id] = component
             sub_id -= 1
+        log.debug("噪声点按连通性拆分为 %d 个子簇", -1 - sub_id)
 
     # 组装输出
     result: List[Dict] = []
@@ -229,6 +246,7 @@ def cluster_spots_by_geo(
 
     # 簇按 size 降序、cluster_id 升序排（噪声簇放最后）
     result.sort(key=lambda c: (c["cluster_id"] == -1, -c["size"], c["cluster_id"]))
+    log.info("聚类完成: 生成 %d 个有效簇（已过滤孤点）", len(result))
     return result
 
 
@@ -252,6 +270,11 @@ def export_clusters_to_geojson(
     返回：
         GeoJSON FeatureCollection dict
     """
+    # 逻辑流程：遍历每个簇 → 以簇中心生成一个 Point Feature（坐标按 GeoJSON
+    # [lng, lat] 顺序）→ 汇总为 FeatureCollection → 可选落盘。
+    log.info("导出聚类 GeoJSON: %d 个簇%s",
+             len(clusters), f", 写入 {output_path}" if output_path else "（仅返回 dict）")
+
     features = []
     for c in clusters:
         center = c["center"]

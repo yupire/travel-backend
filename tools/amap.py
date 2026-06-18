@@ -34,6 +34,51 @@ _CacheVal = Tuple[Any, float]
 _cache: Dict[str, _CacheVal] = {}
 _cache_lock = threading.Lock()
 
+# ──────────────────── 限流 / 重试配置 ────────────────────
+# 高德对单 key 有「每秒并发数 (CUQPS)」限制，个人认证 key 通常只有几次/秒。
+# 超限时高德返回 infocode=10021 (CUQPS_HAS_EXCEEDED_THE_LIMIT)。
+# 下面用「信号量限制并发 + 最小请求间隔」把瞬时 QPS 压到限制以下，
+# 并对限流类错误做指数退避重试，避免把临时限流当成致命错误抛出。
+
+# 最大并发请求数（同一时刻最多有几个高德请求在途）
+_MAX_CONCURRENCY = int(os.getenv("AMAP_MAX_CONCURRENCY", "2"))
+# 相邻两次请求的最小间隔（秒），进一步平滑突发流量
+_MIN_REQUEST_INTERVAL = float(os.getenv("AMAP_MIN_INTERVAL", "0.35"))
+# 命中限流后的最大重试次数
+_MAX_RETRIES = int(os.getenv("AMAP_MAX_RETRIES", "3"))
+# 退避基数（秒）：第 n 次重试等待 _BACKOFF_BASE * 2**(n-1)
+_BACKOFF_BASE = float(os.getenv("AMAP_BACKOFF_BASE", "0.5"))
+# 可重试的高德业务 infocode（限流 / 并发超限类，等待后通常可恢复）
+_RETRYABLE_INFOCODES = {
+    "10021",  # CUQPS_HAS_EXCEEDED_THE_LIMIT 每秒并发量超限
+    "10019",  # CUQPS_HAS_EXCEEDED_THE_LIMIT（部分接口编码）
+    "10029",  # CUQPS 限制（按分钟）
+}
+
+# 控制并发的信号量
+_concurrency_sem = threading.Semaphore(_MAX_CONCURRENCY)
+# 保护「上次请求时间」的锁，用于实现最小请求间隔
+_rate_lock = threading.Lock()
+_last_request_at = 0.0
+
+
+def _throttle() -> None:
+    """在真正发起 HTTP 请求前调用，保证相邻请求间隔 >= _MIN_REQUEST_INTERVAL。
+
+    用一把全局锁串行化「读取上次时间 + 必要时 sleep + 更新时间」，
+    使得无论多少线程并发，发往高德的请求都被拉开到最小间隔以上。
+    """
+    global _last_request_at
+    if _MIN_REQUEST_INTERVAL <= 0:
+        return
+    with _rate_lock:
+        now = time.monotonic()
+        wait = _last_request_at + _MIN_REQUEST_INTERVAL - now
+        if wait > 0:
+            time.sleep(wait)
+            now = time.monotonic()
+        _last_request_at = now
+
 
 class AMapError(RuntimeError):
     """高德 API 错误异常类
@@ -150,35 +195,64 @@ def _request(
     # 添加 API Key 参数
     all_params = {**(params or {}), "key": _api_key()}
 
-    try:
-        with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
-            resp = client.get(url, params=all_params)
-    except httpx.HTTPError as e:
-        raise AMapError(f"高德 API 网络错误 {path}: {e}") from e
+    # 统一打印本次请求的入参（key 不打印），方便在出错时定位是哪些参数惹的祸。
+    # 放在 _request 层，所有高德接口（路径规划 / POI 搜索等）都自动有入参日志。
+    log.info("高德 API 请求 %s 入参=%s", path, params or {})
 
-    if resp.status_code != 200:
-        raise AMapError(
-            f"高德 API HTTP {resp.status_code} {path}: {resp.text[:200]}"
-        )
+    # 命中限流 (infocode in _RETRYABLE_INFOCODES) 时退避重试；
+    # attempt 从 0 开始，0 为首次请求，1.._MAX_RETRIES 为重试。
+    last_error: Optional[AMapError] = None
+    for attempt in range(_MAX_RETRIES + 1):
+        # 信号量限制并发 + 最小间隔，把瞬时 QPS 压到高德限制以下
+        with _concurrency_sem:
+            _throttle()
+            try:
+                with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
+                    resp = client.get(url, params=all_params)
+            except httpx.HTTPError as e:
+                raise AMapError(f"高德 API 网络错误 {path}: {e}") from e
 
-    try:
-        data = resp.json()
-    except ValueError as e:
-        raise AMapError(f"高德 API 响应不是合法 JSON {path}: {e}") from e
+        if resp.status_code != 200:
+            raise AMapError(
+                f"高德 API HTTP {resp.status_code} {path}: {resp.text[:200]}"
+            )
 
-    # 高德业务状态码：1 表示成功，0 表示失败
-    status = data.get("status")
-    if status != "1":
-        infocode = data.get("infocode", "")
+        try:
+            data = resp.json()
+        except ValueError as e:
+            raise AMapError(f"高德 API 响应不是合法 JSON {path}: {e}") from e
+
+        # 高德业务状态码：1 表示成功，0 表示失败
+        status = data.get("status")
+        if status == "1":
+            if cache_ttl > 0:
+                _cache_set(cache_key, data, cache_ttl)
+            return data
+
+        infocode = str(data.get("infocode", ""))
         info = data.get("info", "")
+
+        # 限流类错误：还有重试机会就退避后重试，否则抛出
+        if infocode in _RETRYABLE_INFOCODES and attempt < _MAX_RETRIES:
+            backoff = _BACKOFF_BASE * (2 ** attempt)
+            log.warning(
+                "高德 API 限流 %s: infocode=%s, info=%s；第 %d/%d 次退避重试，等待 %.2fs",
+                path, infocode, info, attempt + 1, _MAX_RETRIES, backoff,
+            )
+            last_error = AMapError(
+                f"高德 API 业务错误 {path}: status={status}, infocode={infocode}, info={info}"
+            )
+            time.sleep(backoff)
+            continue
+
+        # 非限流错误，或重试已用尽：直接抛出（带上入参，便于定位）
         raise AMapError(
-            f"高德 API 业务错误 {path}: status={status}, infocode={infocode}, info={info}"
+            f"高德 API 业务错误 {path}: status={status}, infocode={infocode}, "
+            f"info={info}, 入参={params or {}}"
         )
 
-    if cache_ttl > 0:
-        _cache_set(cache_key, data, cache_ttl)
-
-    return data
+    # 理论上不会走到这里（循环内要么 return 要么 raise），兜底抛最后一次错误
+    raise last_error or AMapError(f"高德 API 请求失败 {path}: 未知错误")
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +293,61 @@ def is_chinese_city(city_name: str) -> bool:
 
     normalized = city_name.strip()
     return normalized in chinese_names or normalized.lower() in chinese_pinyin
+
+
+# 行政区（adcode）数据非常稳定，缓存 7 天
+_DISTRICT_TTL_SECONDS = 7 * 24 * 60 * 60
+
+
+def city_to_adcode(city: str) -> Optional[str]:
+    """城市名 → 高德 adcode（citycode）
+
+    高德 v5 公交路径规划 `/v5/direction/transit/integrated` 的 city1/city2
+    只接受 citycode（行政区编码 adcode），不接受城市名；传名字会报
+    INVALID_PARAMS (infocode=20000)。这里用「行政区查询」接口把城市名解析成 adcode。
+
+    解析策略：
+    - 已是纯数字 → 视为 adcode 直接返回
+    - 拼音 → 先 normalize_city_name 转中文，提升匹配率
+    - 解析失败 / 非中国城市 → 返回 None（由调用方决定如何降级）
+
+    结果带 7 天缓存（行政区数据稳定）。
+
+    Args:
+        city: 城市名（中文或拼音）或 adcode
+
+    Returns:
+        Optional[str]: adcode 字符串，解析不到返回 None
+    """
+    if not city:
+        return None
+
+    name = city.strip()
+    # 已经是 adcode（纯数字），直接用
+    if name.isdigit():
+        return name
+
+    # 拼音 → 中文，提升行政区接口匹配率
+    normalized = normalize_city_name(name)
+    try:
+        data = _request(
+            "/v3/config/district",
+            params={"keywords": normalized, "subdistrict": "0"},
+            cache_ttl=_DISTRICT_TTL_SECONDS,
+        )
+    except AMapError as e:
+        log.warning("解析城市 adcode 失败 city=%s（归一化=%s）: %s", city, normalized, e)
+        return None
+
+    districts = data.get("districts") or []
+    if not districts:
+        log.warning("行政区查询无结果 city=%s（归一化=%s）", city, normalized)
+        return None
+
+    adcode = districts[0].get("adcode") or None
+    log.info("城市 adcode 解析: %s -> %s (%s)",
+             city, adcode, districts[0].get("name", ""))
+    return adcode
 
 
 def normalize_city_name(city: str) -> str:

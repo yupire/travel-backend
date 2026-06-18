@@ -1,6 +1,6 @@
 """景点室内外判断工具
 
-根据景点的 typecode（高德 POI 分类）、类型关键词、或 mock 数据中的
+根据景点的 typecode（高德 POI 分类）、类型关键词、或景点数据中的
 `type` / `is_indoor` 字段，判断一个景点属于室内（indoor）还是室外（outdoor）。
 
 判断优先级：
@@ -135,7 +135,7 @@ def classify_spot_indoor(
 def classify_spots_by_city(city: str, spot_names: Optional[List[str]] = None) -> List[Dict]:
     """判断一个城市若干景点（按名称匹配）的室内外属性。
 
-    数据来源：复用 get_top_spots() —— 中国城市走高德 API，其他城市走 mock。
+    数据来源：复用 get_top_spots() —— 中国城市走高德 API，其他城市返回空列表。
 
     Args:
         city: 城市名称（中文或拼音）

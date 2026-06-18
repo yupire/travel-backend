@@ -25,6 +25,7 @@ try:
         _cache_get,
         _cache_set,
         _request,
+        city_to_adcode,
         is_configured,
         parse_location,
     )
@@ -37,6 +38,7 @@ except ImportError:
     _cache_get = amap._cache_get
     _cache_set = amap._cache_set
     _request = amap._request
+    city_to_adcode = amap.city_to_adcode
     is_configured = amap.is_configured
     parse_location = amap.parse_location
 
@@ -140,11 +142,13 @@ def plan_driving_route(
     Raises:
         AMapError: API 调用失败时
     """
+    log.info("驾车路径规划: origin=%s, destination=%s", origin, destination)
     cache_key = f"driving:{origin}:{destination}"
 
     # 检查缓存
     cached = _cache_get(cache_key)
     if cached is not None:
+        log.info("驾车路径规划命中缓存: %s", cache_key)
         return cached
 
     if not is_configured():
@@ -155,6 +159,7 @@ def plan_driving_route(
     formatted_destination = _format_location(destination)
 
     # 请求高德 API
+    log.info("调用高德驾车 API: origin=%s, destination=%s", formatted_origin, formatted_destination)
     data = _request(
         "/v5/direction/driving",
         params={
@@ -179,6 +184,7 @@ def plan_driving_route(
         "paths": paths,
     }
 
+    log.info("驾车路径规划完成: 共 %d 条路径, 预估打车费 %d 元", len(paths), result["taxi_cost"])
     _cache_set(cache_key, result, _DIRECTION_TTL_SECONDS)
     return result
 
@@ -202,11 +208,13 @@ def plan_walking_route(
     Raises:
         AMapError: API 调用失败时
     """
+    log.info("步行路径规划: origin=%s, destination=%s", origin, destination)
     cache_key = f"walking:{origin}:{destination}"
 
     # 检查缓存
     cached = _cache_get(cache_key)
     if cached is not None:
+        log.info("步行路径规划命中缓存: %s", cache_key)
         return cached
 
     if not is_configured():
@@ -217,6 +225,7 @@ def plan_walking_route(
     formatted_destination = _format_location(destination)
 
     # 请求高德 API
+    log.info("调用高德步行 API: origin=%s, destination=%s", formatted_origin, formatted_destination)
     data = _request(
         "/v5/direction/walking",
         params={
@@ -240,6 +249,7 @@ def plan_walking_route(
         "paths": paths,
     }
 
+    log.info("步行路径规划完成: 共 %d 条路径", len(paths))
     _cache_set(cache_key, result, _DIRECTION_TTL_SECONDS)
     return result
 
@@ -263,11 +273,13 @@ def plan_bicycling_route(
     Raises:
         AMapError: API 调用失败时
     """
+    log.info("骑行路径规划: origin=%s, destination=%s", origin, destination)
     cache_key = f"bicycling:{origin}:{destination}"
 
     # 检查缓存
     cached = _cache_get(cache_key)
     if cached is not None:
+        log.info("骑行路径规划命中缓存: %s", cache_key)
         return cached
 
     if not is_configured():
@@ -278,6 +290,7 @@ def plan_bicycling_route(
     formatted_destination = _format_location(destination)
 
     # 请求高德 API
+    log.info("调用高德骑行 API: origin=%s, destination=%s", formatted_origin, formatted_destination)
     data = _request(
         "/v5/direction/bicycling",
         params={
@@ -301,6 +314,7 @@ def plan_bicycling_route(
         "paths": paths,
     }
 
+    log.info("骑行路径规划完成: 共 %d 条路径", len(paths))
     _cache_set(cache_key, result, _DIRECTION_TTL_SECONDS)
     return result
 
@@ -324,11 +338,13 @@ def plan_electrobike_route(
     Raises:
         AMapError: API 调用失败时
     """
+    log.info("电动车路径规划: origin=%s, destination=%s", origin, destination)
     cache_key = f"electrobike:{origin}:{destination}"
 
     # 检查缓存
     cached = _cache_get(cache_key)
     if cached is not None:
+        log.info("电动车路径规划命中缓存: %s", cache_key)
         return cached
 
     if not is_configured():
@@ -339,6 +355,7 @@ def plan_electrobike_route(
     formatted_destination = _format_location(destination)
 
     # 请求高德 API
+    log.info("调用高德电动车 API: origin=%s, destination=%s", formatted_origin, formatted_destination)
     data = _request(
         "/v5/direction/electrobike",
         params={
@@ -362,6 +379,7 @@ def plan_electrobike_route(
         "paths": paths,
     }
 
+    log.info("电动车路径规划完成: 共 %d 条路径", len(paths))
     _cache_set(cache_key, result, _DIRECTION_TTL_SECONDS)
     return result
 
@@ -487,11 +505,13 @@ def plan_transit_route(
     Raises:
         AMapError: API 调用失败时
     """
+    log.info("公交/地铁路径规划: origin=%s, destination=%s, city=%s", origin, destination, city)
     cache_key = f"transit:{origin}:{destination}:{city}"
 
     # 检查缓存
     cached = _cache_get(cache_key)
     if cached is not None:
+        log.info("公交/地铁路径规划命中缓存: %s", cache_key)
         return cached
 
     if not is_configured():
@@ -501,14 +521,28 @@ def plan_transit_route(
     formatted_origin = _format_location(origin)
     formatted_destination = _format_location(destination)
 
+    # 高德 v5 公交规划要求 city1/city2 为 citycode(adcode)，不接受城市名，
+    # 否则报 INVALID_PARAMS(20000)。这里先把城市名解析成 adcode。
+    adcode = city_to_adcode(city)
+    if not adcode:
+        # 解析不到（如拼写错误，或 singapore/paris 等非中国城市）：
+        # 公交规划仅支持中国城市，给出明确错误而非把城市名硬塞给高德。
+        raise AMapError(
+            f"公交/地铁规划无法解析城市「{city}」的 citycode："
+            "请确认是中国城市名（如「北京」）或直接传 adcode。"
+            "高德公交路径规划仅支持中国城市。"
+        )
+
     # 请求高德 API
+    log.info("调用高德公交/地铁 API: origin=%s, destination=%s, city=%s, adcode=%s",
+             formatted_origin, formatted_destination, city, adcode)
     data = _request(
         "/v5/direction/transit/integrated",
         params={
             "origin": formatted_origin,
             "destination": formatted_destination,
-            "city1": city,
-            "city2": city,
+            "city1": adcode,
+            "city2": adcode,
         },
         cache_ttl=_DIRECTION_TTL_SECONDS,
     )
@@ -538,6 +572,7 @@ def plan_transit_route(
         "transits": transits,
     }
 
+    log.info("公交/地铁路径规划完成: 共 %d 个换乘方案", len(transits))
     _cache_set(cache_key, result, _DIRECTION_TTL_SECONDS)
     return result
 
@@ -578,12 +613,16 @@ def plan_route(
         "transit": plan_transit_route,
     }
 
+    log.info("路径规划请求: mode=%s, origin=%s, destination=%s, city=%s", mode, origin, destination, city)
+
     planner = mode_map.get(mode)
     if not planner:
+        log.warning("不支持的交通方式: %s", mode)
         raise ValueError(f"不支持的交通方式: {mode}，支持的选项: {list(mode_map.keys())}")
 
     if mode == "transit":
         if not city:
+            log.warning("transit 模式缺少 city 参数")
             raise ValueError("transit 模式需要提供 city 参数")
         return planner(origin, destination, city)
 

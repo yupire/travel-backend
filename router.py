@@ -14,13 +14,13 @@ router = APIRouter()
 # 城市列表
 @router.get("/cities")
 def list_cities():
-    """Mock: list of supported cities."""
+    """返回支持的城市列表。"""
     return {"cities": get_cities()}
 
 # 查询单个城市
 @router.get("/cities/{location}")
 def list_cities(location:str):
-    """Mock: list of supported cities."""
+    """按名称查询单个城市。"""
     return {"cities": get_city(location)}
 
 
