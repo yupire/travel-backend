@@ -1,31 +1,52 @@
 """LangGraph 旅行规划 Agent
 
-Graph 流程骨架：
+完整 Graph 流程：
 
-    ┌─────┐   1. 需要工具   ┌────────┐
-    │START├───────────────►│  tools │
-    └──┬──┘                 └───┬────┘
-       │                        │ 2. 工具结果返回
-       │ 3. 推理                ▼
-       │                    ┌────────┐
-       └───────────────────►│ agent  │◄────────┐
-                            └───┬────┘         │
-                                │ 4. 无工具调用 │
-                                ▼              │
-                              ┌─────┐          │
-                              │ END │  (回到第 1 步继续工具循环)
-                              └─────┘
+                      ┌───────┐
+                      │ START │
+                      └───┬───┘
+                          ▼
+       tools 执行完   ┌─────────┐
+       必回 agent     │  agent  │  调用绑定工具的 LLM 推理
+    ┌────────────────►│  (LLM)  │
+    │                 └────┬────┘
+    │                      │ should_continue 按最后一条消息路由：
+    │     ┌────────────────┼─────────────────┬──────────────────┐
+    │     │ 有 tool_calls  │ 无 tool_calls    │ agent 自身异常    │ retry ≥ MAX_RETRY
+    │     ▼                ▼                  │ 且 retry < MAX    ▼
+    │  ┌───────┐      ┌──────────┐            │ ↑（回 agent     ┌──────────┐
+    │  │ tools │      │  format  │            └──┘  重试）       │ fallback │
+    │  │(ToolN)│      │ (JSON 模 │                              │(模板降级)│
+    │  └───┬───┘      │  式 LLM) │                              └────┬─────┘
+    │      │          └────┬─────┘                                   │
+    └──────┘               │                                         │
+   失败时汇总错误、         └──────────────────┬──────────────────────┘
+   注入引导消息                                ▼
+   （先修复再继续）                          ┌───────┐
+                                            │  END  │
+                                            └───┬───┘
+                                                ▼
+                            plan_trip 解析最终消息：
+                            _extract_json_payload → _build_trip_response
+                            （逐天校验 / 缺字段兜底）
+                            → 始终返回合法完整的 TripResponse（绝不 500）
 
 节点说明：
-- agent  : 调用 LLM 推理，决定调用哪些工具 / 是否结束
-- tools  : LangGraph ToolNode，按 LLM 决策执行 backend/tools 中已注册的工具
+- agent   : 调用绑定工具的 LLM 推理，决定调用哪些工具 / 是否结束
+- tools   : LangGraph ToolNode，按 LLM 决策执行 backend/tools 中已注册的工具；
+            本包装层还会收集失败的工具调用并回灌引导消息，要求先修复再继续
+- format  : LLM 不再调用工具时，用 JSON 模式 LLM 把对话里收集到的全部数据
+            （工具返回的经纬度/门票/交通 + Agent 规划）整理成严格 TripResponse JSON
 - fallback: 工具 / LLM 重试超限时的硬编码降级路径（不调 LLM，模板输出）
 
-条件边：
-- agent → tools   : LLM 在响应中产生了 tool_calls
-- agent → fallback: LLM 异常 / 重试次数超限
-- agent → END     : LLM 不再调用工具，视为完成
-- tools → agent   : 工具执行完必回 agent，让 LLM 看结果再决定
+条件边（should_continue 的返回值 → path_map）：
+- agent → tools    : LLM 在响应中产生了 tool_calls
+- agent → agent    : agent 自身异常（[agent_node error]），且 retry < MAX_RETRY，重试
+- agent → format   : LLM 不再调用工具，进入格式化节点产出严格 JSON
+- agent → fallback : retry ≥ MAX_RETRY（异常/重试超限）
+- tools → agent    : 工具执行完必回 agent，让 LLM 看结果再决定（固定边）
+- format → END     : 固定边
+- fallback → END   : 固定边
 """
 from __future__ import annotations
 
@@ -43,7 +64,7 @@ from langgraph.prebuilt import ToolNode
 
 from models import DayPlan, TripRequest, TripResponse
 from tools import ALL_TOOLS
-from agent.prompts import build_initial_messages
+from agent.prompts import FORMAT_OUTPUT_PROMPT, build_initial_messages
 
 
 # ──────────────────────── 日志 ────────────────────────
@@ -67,6 +88,17 @@ _llm = ChatOpenAI(
     # 透传 OpenAI SDK 不直接支持的字段（如 thinking）
     model_kwargs={"extra_body": {"thinking": {"type": "enabled"}}},
 ).bind_tools(ALL_TOOLS)
+
+# 格式化链：不绑工具、开启 JSON 模式，专门把 Agent 收集到的数据整理成严格
+# TripResponse JSON。DeepSeek 倾向于输出 Markdown 攻略，靠 system prompt 约束不可靠，
+# 这里用 response_format=json_object 强制结构化输出。
+_formatter_llm = ChatOpenAI(
+    base_url="https://api.deepseek.com",
+    api_key=os.getenv("DEEPSEEK_API_KEY"),
+    model="deepseek-v4-pro",
+    streaming=False,
+    model_kwargs={"response_format": {"type": "json_object"}},
+)
 
 # ──────────────────────── State ────────────────────────
 class TravelState(TypedDict):
@@ -220,6 +252,30 @@ def tools_node(state: TravelState) -> dict:
     return out
 
 
+def format_node(state: TravelState) -> dict:
+    """节点 4：Agent 推理结束后，把对话中收集到的全部数据整理成严格 TripResponse JSON。
+
+    Agent（绑定工具的主链）倾向于输出 Markdown 攻略而非结构化 JSON，导致 itinerary
+    解析为空。这里用开启 JSON 模式的 _formatter_llm，带着完整对话历史（含工具返回的
+    经纬度/门票/交通）再跑一次，强制产出可被 TripResponse 解析的 JSON。
+    """
+    step = state.get("step", 0) + 1
+    messages = state.get("messages") or []
+    logger.info("【第 %d 步】进入 format_node[结构化输出]：city=%s, 历史消息数=%d",
+                step, state.get("city"), len(messages))
+
+    # 在完整历史后追加格式化指令，让 LLM 基于已收集数据输出严格 JSON
+    convo = list(messages) + [HumanMessage(content=FORMAT_OUTPUT_PROMPT)]
+    try:
+        response = _formatter_llm.invoke(convo)
+        logger.info("【第 %d 步】format_node 完成结构化 JSON 输出", step)
+        return {"messages": [response], "step": step}
+    except Exception as e:
+        # 格式化失败不致命：保留 Agent 原始输出，由 plan_trip 兜底成完整结构
+        logger.exception("【第 %d 步】format_node 失败，保留原始输出兜底：%r", step, e)
+        return {"step": step}
+
+
 def fallback_node(state: TravelState) -> dict:
     """降级节点：LLM 多次失败时，硬编码用模板生成（不依赖 LLM）。"""
     step = state.get("step", 0) + 1
@@ -267,7 +323,7 @@ def should_continue(state: TravelState) -> str:
     - "tools"        → 调用工具
     - "agent"        → agent 自身异常，未超限时重试一次
     - "fallback"     → 异常 / 重试超限，走降级
-    - END            → LLM 不再调用工具，已输出最终 TripResponse JSON，直接结束
+    - "format"       → LLM 不再调用工具，进入格式化节点产出严格 JSON
     """
     # 1) 重试次数超限：直接降级
     retry = state.get("retry_count", 0)
@@ -297,11 +353,10 @@ def should_continue(state: TravelState) -> str:
         logger.info("should_continue: LLM 请求 %d 个工具 -> tools", len(tool_calls))
         return "tools"
 
-    # 4) LLM 不再调用工具：此时它应已按 SYSTEM_PROMPT 输出完整 TripResponse JSON，
-    #    直接结束，由 plan_trip 解析。不再经过 reasoning 节点（它输出的是
-    #    {days, summary} 残缺 schema，会覆盖掉完整 JSON 导致 TripResponse 校验失败）。
-    logger.info("should_continue: LLM 无工具调用，视为已产出最终 JSON -> END")
-    return END
+    # 4) LLM 不再调用工具：进入 format 节点，用 JSON 模式把已收集数据整理成严格
+    #    TripResponse JSON（Agent 主链常输出 Markdown，不能直接当最终结果）。
+    logger.info("should_continue: LLM 无工具调用 -> format")
+    return "format"
 
 
 # ──────────────────────── 组装 Graph ────────────────────────
@@ -310,6 +365,7 @@ graph = StateGraph(TravelState)
 # 节点
 graph.add_node("agent", agent_node)
 graph.add_node("tools", tools_node)
+graph.add_node("format", format_node)
 graph.add_node("fallback", fallback_node)
 
 # 入口
@@ -322,6 +378,7 @@ graph.add_conditional_edges(
     {
         "tools": "tools",
         "agent": "agent",
+        "format": "format",
         "fallback": "fallback",
         END: END,
     },
@@ -330,7 +387,8 @@ graph.add_conditional_edges(
 # 工具节点执行完一定回 agent（agent 看完结果再判断）
 graph.add_edge("tools", "agent")
 
-# fallback 完即结束
+# format 与 fallback 完即结束
+graph.add_edge("format", END)
 graph.add_edge("fallback", END)
 
 app = graph.compile()
