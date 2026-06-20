@@ -54,4 +54,7 @@ _formatter_llm = ChatOpenAI(
     # 仍失败则抛出，交给 format_node 的节点级重试（见 after_format）。
     timeout=120,
     max_retries=1,
+    # 关掉 thinking：deepseek-v4-pro 默认开 thinking，但格式化只是把已收集好的数据
+    # 重排成 JSON，无需推理。开着会让它带 20+ 条历史「边想边重组」，又慢又易卡。
+    model_kwargs={"extra_body": {"thinking": {"type": "disabled"}}},
 ).with_structured_output(TripResponse, method="json_mode")

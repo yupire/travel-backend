@@ -15,6 +15,8 @@ Graph 的具体结构与节点逻辑已拆分到同包其它模块：
 from __future__ import annotations
 
 import logging
+import queue
+import threading
 
 from models import TripRequest, TripResponse
 from agent.graph import app
@@ -102,7 +104,7 @@ def plan_trip(request: TripRequest) -> TripResponse:
     return _finalize(final_state, request, dates)
 
 
-def plan_trip_stream(request: TripRequest):
+def _plan_events(request: TripRequest):
     """流式触发 Graph：每一步都吐进度事件，结构化完成后再吐最终结果。
 
     yield 的事件均为 dict：
@@ -112,6 +114,9 @@ def plan_trip_stream(request: TripRequest):
         Agent 推理结束、即将进入 format 结构化时发出，提示「正在整理」。
     - {"type": "result", "data": <TripResponse dict>}
         format 结构化完成后发出，携带最终行程；前端收到后清空进度、只展示行程。
+
+    注意：本函数是「纯事件源」，不负责保活；format_node 是一次可能耗时数十秒的阻塞
+    LLM 调用，期间这里不会 yield 任何事件。保活心跳由外层 plan_trip_stream 注入。
 
     用 app.stream(stream_mode="values") 逐步拿到完整 state：每跑完一个节点都会吐一份
     完整累计 state。这里跟踪「已处理到第几条消息」，对每条新增的 AI 消息按其 tool_calls
@@ -191,3 +196,49 @@ def plan_trip_stream(request: TripRequest):
             summary="（行程生成失败，请重试）",
         )
     yield {"type": "result", "data": resp.model_dump()}
+
+
+# 阻塞步骤（format_node 的 LLM 调用）期间多久没有真实事件就补一条心跳。取值要明显
+# 小于浏览器/反向代理的空闲超时（通常 30~60s+），5s 足够保活且开销极低。
+_HEARTBEAT_INTERVAL = 5
+
+
+def plan_trip_stream(request: TripRequest):
+    """对外的流式入口：在 _plan_events 的真实事件之间注入心跳，避免 SSE 长时间静默。
+
+    _plan_events 里的 format_node 是一次可能耗时数十秒的阻塞 LLM 调用，期间不产生任何
+    事件。若直接把它当生成器 yield，这段时间连接一个字节都不发 → 被浏览器/反代判定空闲
+    超时而断开（前端表现为 network error）。这里把 _plan_events 放到后台线程推进队列，
+    主协程用带超时的 get 抽事件：
+    - 正常拿到事件          -> 原样透传（progress / result）；
+    - 超时（队列静默）      -> 说明正卡在阻塞步骤，补一条 {"type":"heartbeat"} 保活；
+    - 线程内抛异常          -> 原样重抛，交由 router 的 event_stream 兜底成 error 事件。
+
+    心跳事件对前端无业务含义，前端按「未知 type」忽略即可。
+    """
+    q: "queue.Queue[tuple]" = queue.Queue()
+    _DONE = object()
+
+    def _worker():
+        try:
+            for event in _plan_events(request):
+                q.put(("event", event))
+        except Exception as e:  # noqa: BLE001 —— 原样转交主协程，不在子线程里吞掉
+            q.put(("error", e))
+        finally:
+            q.put((_DONE, None))
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+    while True:
+        try:
+            kind, payload = q.get(timeout=_HEARTBEAT_INTERVAL)
+        except queue.Empty:
+            # 队列静默：正处于 format 等阻塞步骤，补心跳维持连接活性
+            yield {"type": "heartbeat"}
+            continue
+        if kind is _DONE:
+            break
+        if kind == "error":
+            raise payload
+        yield payload
