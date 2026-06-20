@@ -545,17 +545,48 @@ def _finalize(final_state: dict, request: TripRequest, dates: list[str]) -> Trip
     return _build_trip_response(payload, request, dates, raw_text)
 
 
-def _is_reasoning_done(message) -> bool:
-    """判断一条消息是否代表「Agent 推理完成、即将进入 format 结构化」。
+# 工具名 → 前端展示用的友好中文描述。让流式进度能告诉用户「这一步在做什么」，
+# 而不暴露内部英文函数名。未登记的工具回退用工具名本身。
+_TOOL_LABELS = {
+    "list_supported_cities": "获取支持的城市列表",
+    "get_tourist_spots": "查询热门景点",
+    "geocode_spot_locations": "解析景点坐标",
+    "get_city_weather": "查询天气",
+    "get_food_recommendations": "推荐当地美食",
+    "cluster_spots_geographically": "按地理位置聚类景点",
+    "export_clusters_geojson": "导出景点聚类地图",
+    "plan_driving_directions": "规划驾车路线",
+    "plan_walking_directions": "规划步行路线",
+    "plan_bicycling_directions": "规划骑行路线",
+    "plan_electrobike_directions": "规划电动车路线",
+    "plan_transit_directions": "规划公共交通路线",
+    "plan_route_directions": "规划交通路线",
+    "classify_spot_indoor_outdoor": "区分室内/室外景点",
+}
 
-    路由规则（见 should_continue）：当最后一条是 AI 消息且不带 tool_calls 时，
-    Graph 会走向 format 节点。此刻可对外发出「规划已完成，正在整理」的进度信号，
-    让前端先反馈，再等 format 结构化结果返回。
-    异常 / 降级路径产出的是 SystemMessage（type=system），不会命中此判断。
+
+def _describe_tool_call(tool_call: dict) -> str:
+    """把一次工具调用转成一句面向用户的中文进度描述。
+
+    在基础动作（如「查询天气」）后追加关键参数（城市 / 日期 / 出行方式），让进度更
+    具体：例如「查询天气 · beijing 2026-06-20」。参数缺失时只返回动作本身。
     """
-    if getattr(message, "type", "") != "ai":
-        return False
-    return not (getattr(message, "tool_calls", None) or [])
+    name = tool_call.get("name") or "?"
+    label = _TOOL_LABELS.get(name, name)
+    args = tool_call.get("args") or {}
+
+    # 只挑选少量对用户有意义的参数拼到描述后面，避免把整串参数堆给用户
+    hints: list[str] = []
+    for key in ("city", "date", "mode"):
+        val = args.get(key)
+        if val:
+            hints.append(str(val))
+    if not hints and isinstance(args.get("spot_names"), list) and args["spot_names"]:
+        spots = args["spot_names"]
+        preview = "、".join(str(s) for s in spots[:3])
+        hints.append(preview + ("…" if len(spots) > 3 else ""))
+
+    return f"{label} · {' '.join(hints)}" if hints else label
 
 
 # ──────────────────────── 对外入口 ────────────────────────
@@ -574,16 +605,19 @@ def plan_trip(request: TripRequest) -> TripResponse:
 
 
 def plan_trip_stream(request: TripRequest):
-    """流式触发 Graph：先吐进度事件，结构化完成后再吐最终结果。
+    """流式触发 Graph：每一步都吐进度事件，结构化完成后再吐最终结果。
 
     yield 的事件均为 dict：
-    - {"type": "progress", "stage": "formatting", "message": ...}
-        Agent 推理结束、即将进入 format 结构化时发出，前端可提示「正在整理」。
+    - {"type": "progress", "step": N, "stage": "tool", "message": ...}
+        Agent 每决定调用一个工具就发一条，前端按步骤列表展示「当前在做什么」。
+    - {"type": "progress", "step": N, "stage": "formatting", "message": ...}
+        Agent 推理结束、即将进入 format 结构化时发出，提示「正在整理」。
     - {"type": "result", "data": <TripResponse dict>}
-        format 结构化完成后发出，携带最终行程。
+        format 结构化完成后发出，携带最终行程；前端收到后清空进度、只展示行程。
 
-    用 app.stream(stream_mode="values") 逐步拿到完整 state：每跑完一个节点
-    都会吐一份完整 state，借此在「推理完成」与「结构化完成」之间插入进度信号。
+    用 app.stream(stream_mode="values") 逐步拿到完整 state：每跑完一个节点都会吐一份
+    完整累计 state。这里跟踪「已处理到第几条消息」，对每条新增的 AI 消息按其 tool_calls
+    展开成进度，做到「每一步调用工具都给前端一条进度」。
     """
     logger.info("plan_trip_stream 开始：city=%s, %s ~ %s",
                 request.city, request.start_date, request.end_date)
@@ -592,23 +626,52 @@ def plan_trip_stream(request: TripRequest):
     logger.info("plan_trip_stream 行程共 %d 天", len(dates))
 
     final_state: dict | None = None
+    seen = 0                 # 已处理（已转成进度）的 messages 数量
     emitted_formatting = False
+
+    # 起手先发一条，告诉用户 Agent 已经开始分析需求
+    yield {
+        "type": "progress",
+        "step": 0,
+        "stage": "start",
+        "message": "AI 正在分析行程需求…",
+    }
 
     # stream_mode="values"：每步产出完整累计 state（messages 已按 operator.add 合并）
     for state in app.stream(_initial_state(request, dates), stream_mode="values"):
         final_state = state
         messages = state.get("messages") or []
-        last = messages[-1] if messages else None
+        step = state.get("step", 0)
 
-        # 推理完成（AI 消息且无 tool_calls）→ 下一步是 format，提前发进度信号
-        if not emitted_formatting and last is not None and _is_reasoning_done(last):
-            emitted_formatting = True
-            logger.info("plan_trip_stream：Agent 推理完成，发出『正在整理』进度信号")
-            yield {
-                "type": "progress",
-                "stage": "formatting",
-                "message": "规划已完成，正在整理行程…",
-            }
+        # 只处理本步新增的消息，避免重复发送历史消息对应的进度
+        new_messages = messages[seen:]
+        seen = len(messages)
+
+        for msg in new_messages:
+            if getattr(msg, "type", "") != "ai":
+                continue
+            tool_calls = getattr(msg, "tool_calls", None) or []
+            if tool_calls:
+                # AI 决定调用工具：逐个工具发一条进度（含友好动作 + 关键参数）
+                for tc in tool_calls:
+                    desc = _describe_tool_call(tc)
+                    logger.info("plan_trip_stream：第 %d 步进度 → %s", step, desc)
+                    yield {
+                        "type": "progress",
+                        "step": step,
+                        "stage": "tool",
+                        "message": desc,
+                    }
+            elif not emitted_formatting:
+                # AI 不再调用工具 → 下一步是 format，发『正在整理』进度信号
+                emitted_formatting = True
+                logger.info("plan_trip_stream：Agent 推理完成，发出『正在整理』进度信号")
+                yield {
+                    "type": "progress",
+                    "step": step,
+                    "stage": "formatting",
+                    "message": "规划已完成，正在整理行程…",
+                }
 
     if final_state is None:
         logger.error("plan_trip_stream：Graph 未产出任何 state")
