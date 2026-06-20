@@ -87,6 +87,10 @@ _llm = ChatOpenAI(
     model="deepseek-v4-pro",
     streaming=False,
     reasoning_effort="high",
+    # 单次请求超时：DeepSeek 慢/挂起时抛 APITimeoutError，而非无限阻塞。
+    # max_retries：超时/限流/5xx 时由 SDK 自动重试，仍失败才抛给 agent_node 兜底。
+    timeout=90,
+    max_retries=2,
     # 透传 OpenAI SDK 不直接支持的字段（如 thinking）
     model_kwargs={"extra_body": {"thinking": {"type": "enabled"}}},
 ).bind_tools(ALL_TOOLS)
@@ -99,6 +103,10 @@ _formatter_llm = ChatOpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     model="deepseek-v4-pro",
     streaming=False,
+    # 结构化整理要重读整段对话历史，单次较慢，给足超时；超时由 SDK 重试一次，
+    # 仍失败则抛出，交给 format_node 的节点级重试（见 after_format）。
+    timeout=120,
+    max_retries=1,
     model_kwargs={"response_format": {"type": "json_object"}},
 )
 
@@ -114,6 +122,8 @@ class TravelState(TypedDict):
     - step: 全局步骤计数器，每进入一个节点 +1，用于日志里标注「第几步」
     - pois / weather / clusters / daily_plans: 工具调用的中间数据
     - tool_errors: 最近一次 tools_node 执行中失败的工具调用（供路由判定是否需先修复）
+    - format_retry: format_node 因超时/异常失败的重试次数
+    - format_done: format_node 是否已成功产出结构化 JSON（路由判定是否结束）
     """
     city: str
     dates: list[str]
@@ -127,6 +137,8 @@ class TravelState(TypedDict):
     clusters: dict
     daily_plans: list[dict]
     tool_errors: list[dict]
+    format_retry: int
+    format_done: bool
 
 
 # ──────────────────────── 节点定义 ────────────────────────
@@ -262,20 +274,22 @@ def format_node(state: TravelState) -> dict:
     经纬度/门票/交通）再跑一次，强制产出可被 TripResponse 解析的 JSON。
     """
     step = state.get("step", 0) + 1
+    fmt_retry = state.get("format_retry", 0)
     messages = state.get("messages") or []
-    logger.info("【第 %d 步】进入 format_node[结构化输出]：city=%s, 历史消息数=%d",
-                step, state.get("city"), len(messages))
+    logger.info("【第 %d 步】进入 format_node[结构化输出]：city=%s, 历史消息数=%d, 当前格式化重试=%d",
+                step, state.get("city"), len(messages), fmt_retry)
 
     # 在完整历史后追加格式化指令，让 LLM 基于已收集数据输出严格 JSON
     convo = list(messages) + [HumanMessage(content=FORMAT_OUTPUT_PROMPT)]
     try:
         response = _formatter_llm.invoke(convo)
         logger.info("【第 %d 步】format_node 完成结构化 JSON 输出", step)
-        return {"messages": [response], "step": step}
+        return {"messages": [response], "step": step, "format_done": True}
     except Exception as e:
-        # 格式化失败不致命：保留 Agent 原始输出，由 plan_trip 兜底成完整结构
-        logger.exception("【第 %d 步】format_node 失败，保留原始输出兜底：%r", step, e)
-        return {"step": step}
+        # 失败（含超时）不致命：累加重试计数，由 after_format 决定再跑一次还是结束兜底
+        logger.exception("【第 %d 步】format_node 失败，format_retry -> %d：%r",
+                         step, fmt_retry + 1, e)
+        return {"step": step, "format_retry": fmt_retry + 1}
 
 
 def fallback_node(state: TravelState) -> dict:
@@ -357,6 +371,32 @@ def should_continue(state: TravelState) -> str:
     return "format"
 
 
+# format 节点最多重试次数：每次 invoke 自带超时，超时即失败回到这里重试，
+# 用尽后结束（_finalize 会用 Agent 原始输出兜底），保证不会卡死在 format。
+MAX_FORMAT_RETRY = 2
+
+
+def after_format(state: TravelState) -> str:
+    """format 节点后的路由：成功就结束，失败（含超时）未超限则重跑 format。
+
+    - 成功（format_done=True）             -> END
+    - 失败且 format_retry < 上限           -> "format"（重试）
+    - 失败且重试用尽                       -> END（由 _finalize 兜底，不再阻塞）
+    """
+    if state.get("format_done"):
+        return END
+
+    fmt_retry = state.get("format_retry", 0)
+    if fmt_retry < MAX_FORMAT_RETRY:
+        logger.warning("after_format: 格式化失败，重试 format (%d/%d)",
+                       fmt_retry, MAX_FORMAT_RETRY)
+        return "format"
+
+    logger.error("after_format: 格式化重试 %d 次仍失败 -> 结束，交由 _finalize 兜底",
+                 fmt_retry)
+    return END
+
+
 # ──────────────────────── 组装 Graph ────────────────────────
 graph = StateGraph(TravelState)
 
@@ -385,8 +425,17 @@ graph.add_conditional_edges(
 # 工具节点执行完一定回 agent（agent 看完结果再判断）
 graph.add_edge("tools", "agent")
 
-# format 与 fallback 完即结束
-graph.add_edge("format", END)
+# format 后按结果路由：成功结束，失败（含超时）未超限则重跑 format
+graph.add_conditional_edges(
+    "format",
+    after_format,
+    {
+        "format": "format",
+        END: END,
+    },
+)
+
+# fallback 完即结束
 graph.add_edge("fallback", END)
 
 app = graph.compile()
