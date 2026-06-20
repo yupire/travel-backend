@@ -1,0 +1,49 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          113.241101,
+          23.110811499999997
+        ]
+      },
+      "properties": {
+        "cluster_id": -4,
+        "size": 2,
+        "spread_km": 1.157,
+        "indoor_count": 0,
+        "outdoor_count": 2,
+        "spot_names": [
+          "沙面岛",
+          "永庆坊"
+        ],
+        "is_noise": true
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          113.3191805,
+          23.0023615
+        ]
+      },
+      "properties": {
+        "cluster_id": -2,
+        "size": 2,
+        "spread_km": 0.737,
+        "indoor_count": 0,
+        "outdoor_count": 2,
+        "spot_names": [
+          "广州长隆旅游度假区",
+          "长隆野生动物世界"
+        ],
+        "is_noise": true
+      }
+    }
+  ]
+}

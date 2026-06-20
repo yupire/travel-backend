@@ -1,3 +1,3 @@
-from agent.planner import plan_trip
+from agent.planner import plan_trip, plan_trip_stream
 
-__all__ = ["plan_trip"]
+__all__ = ["plan_trip", "plan_trip_stream"]

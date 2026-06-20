@@ -37,7 +37,8 @@
             本包装层还会收集失败的工具调用并回灌引导消息，要求先修复再继续
 - format  : LLM 不再调用工具时，用 JSON 模式 LLM 把对话里收集到的全部数据
             （工具返回的经纬度/门票/交通 + Agent 规划）整理成严格 TripResponse JSON
-- fallback: 工具 / LLM 重试超限时的硬编码降级路径（不调 LLM，模板输出）
+- fallback: 工具 / LLM 重试超限时的固定（确定性）降级路径，转入
+            agent/fallback_graph 的子图重新规划（见该文件），产出合法 TripResponse
 
 条件边（should_continue 的返回值 → path_map）：
 - agent → tools    : LLM 在响应中产生了 tool_calls
@@ -65,6 +66,7 @@ from langgraph.prebuilt import ToolNode
 from models import DayPlan, TripRequest, TripResponse
 from tools import ALL_TOOLS
 from agent.prompts import FORMAT_OUTPUT_PROMPT, build_initial_messages
+from agent.fallback_graph import run_fallback
 
 
 # ──────────────────────── 日志 ────────────────────────
@@ -277,37 +279,33 @@ def format_node(state: TravelState) -> dict:
 
 
 def fallback_node(state: TravelState) -> dict:
-    """降级节点：LLM 多次失败时，硬编码用模板生成（不依赖 LLM）。"""
+    """降级节点：Agent 主链失败时，转入固定（确定性）子图重新规划。
+
+    不再依赖 Agent 自主决策，而是调用 agent/fallback_graph 里的固定图：
+    并行查询景点/天气 → 地理聚类与室内外分类 → 按天气分配 → 路线规划 →
+    生成理由 → 结构化输出。子图保证产出一份合法 TripResponse；这里把它序列化成
+    JSON 文本作为最后一条消息，交由下游 _finalize / _build_trip_response 解析收尾。
+    """
     step = state.get("step", 0) + 1
-    daily_plans = state.get("daily_plans") or []
-    logger.warning("【第 %d 步】进入 fallback_node[降级路径]：city=%s, daily_plans 天数=%d",
-                   step, state.get("city"), len(daily_plans))
-    days = []
-    for i, plan in enumerate(daily_plans, start=1):
-        w = plan.get("weather", {})
-        days.append({
-            "day": i,
-            "date": plan.get("date"),
-            "weather": w,
-            "spots": plan.get("pois", []),
-            "reasoning": (
-                f"{plan.get('date')} 天气{w.get('condition', '未知')}，"
-                "降级路径使用模板生成说明。"
-            ),
-            "is_indoor_outdoor_filter": w.get("condition") == "rainy",
-        })
-    result = {
-        "city": state.get("city"),
-        "start_date": state["dates"][0] if state.get("dates") else "",
-        "end_date": state["dates"][-1] if state.get("dates") else "",
-        "total_days": state.get("days", len(days)),
-        "itinerary": days,
-        "summary": "（降级输出：未经过 LLM 推理生成，仅使用工具数据 + 模板）",
-    }
-    logger.warning("【第 %d 步】fallback_node 模板生成完成：共 %d 天行程", step, len(days))
+    dates = state.get("dates") or []
+    logger.warning("【第 %d 步】进入 fallback_node[固定降级子图]：city=%s, 天数=%d",
+                   step, state.get("city"), state.get("days", len(dates)))
+
+    resp = run_fallback(
+        city=state.get("city", ""),
+        dates=dates,
+        days=state.get("days", len(dates)),
+    )
+
+    # 用标准 JSON 序列化（注意不能用 str(dict)：那是 Python repr，单引号无法被
+    # json.loads 解析，会导致 _finalize 丢掉整张行程）。
+    import json
+    payload = json.dumps(resp.model_dump(), ensure_ascii=False)
+    logger.warning("【第 %d 步】fallback_node 固定子图完成：共 %d 天行程",
+                   step, len(resp.itinerary))
     return {
         "is_fallback": True,
-        "messages": [SystemMessage(content=str(result))],
+        "messages": [SystemMessage(content=payload)],
         "step": step,
     }
 
@@ -494,25 +492,22 @@ def _build_trip_response(
         )
 
 
-# ──────────────────────── 对外入口 ────────────────────────
-def plan_trip(request: TripRequest) -> TripResponse:
-    """调用 Agent，串行触发整个 Graph，返回结构化 TripResponse。"""
+# ──────────────────────── 公共辅助 ────────────────────────
+def _expand_dates(request: TripRequest) -> list[str]:
+    """把起止日期展开成逐日列表（含首尾），供各节点按天处理。"""
     from datetime import datetime, timedelta
 
-    logger.info("plan_trip 开始：city=%s, %s ~ %s",
-                request.city, request.start_date, request.end_date)
-
-    # 把起止日期展开成逐日列表（含首尾），供各节点按天处理
     start = datetime.fromisoformat(request.start_date)
     end = datetime.fromisoformat(request.end_date)
-    dates = [
+    return [
         (start + timedelta(days=i)).date().isoformat()
         for i in range((end - start).days + 1)
     ]
-    logger.info("plan_trip 行程共 %d 天", len(dates))
 
-    # 同步触发整个 Graph：从 START -> agent，循环工具调用直到 reasoning/fallback
-    final_state = app.invoke({
+
+def _initial_state(request: TripRequest, dates: list[str]) -> dict:
+    """构造 Graph 入口 state。"""
+    return {
         "city": request.city,
         "dates": dates,
         "days": len(dates),
@@ -525,8 +520,11 @@ def plan_trip(request: TripRequest) -> TripResponse:
         "clusters": {},
         "daily_plans": [],
         "tool_errors": [],
-    })
+    }
 
+
+def _finalize(final_state: dict, request: TripRequest, dates: list[str]) -> TripResponse:
+    """从 Graph 最终 state 中提取最后一条消息并收敛成合法 TripResponse。"""
     logger.info("Graph 执行结束：is_fallback=%s, 最终消息数=%d",
                 final_state.get("is_fallback"),
                 len(final_state.get("messages", [])))
@@ -545,3 +543,76 @@ def plan_trip(request: TripRequest) -> TripResponse:
     # 无论解析结果如何，_build_trip_response 都会返回一个合法完整的 TripResponse，
     # 不会再因缺字段抛 ValidationError 导致 /plan 返回 500。
     return _build_trip_response(payload, request, dates, raw_text)
+
+
+def _is_reasoning_done(message) -> bool:
+    """判断一条消息是否代表「Agent 推理完成、即将进入 format 结构化」。
+
+    路由规则（见 should_continue）：当最后一条是 AI 消息且不带 tool_calls 时，
+    Graph 会走向 format 节点。此刻可对外发出「规划已完成，正在整理」的进度信号，
+    让前端先反馈，再等 format 结构化结果返回。
+    异常 / 降级路径产出的是 SystemMessage（type=system），不会命中此判断。
+    """
+    if getattr(message, "type", "") != "ai":
+        return False
+    return not (getattr(message, "tool_calls", None) or [])
+
+
+# ──────────────────────── 对外入口 ────────────────────────
+def plan_trip(request: TripRequest) -> TripResponse:
+    """调用 Agent，串行触发整个 Graph，返回结构化 TripResponse。"""
+    logger.info("plan_trip 开始：city=%s, %s ~ %s",
+                request.city, request.start_date, request.end_date)
+
+    dates = _expand_dates(request)
+    logger.info("plan_trip 行程共 %d 天", len(dates))
+
+    # 同步触发整个 Graph：从 START -> agent，循环工具调用直到 reasoning/fallback
+    final_state = app.invoke(_initial_state(request, dates))
+
+    return _finalize(final_state, request, dates)
+
+
+def plan_trip_stream(request: TripRequest):
+    """流式触发 Graph：先吐进度事件，结构化完成后再吐最终结果。
+
+    yield 的事件均为 dict：
+    - {"type": "progress", "stage": "formatting", "message": ...}
+        Agent 推理结束、即将进入 format 结构化时发出，前端可提示「正在整理」。
+    - {"type": "result", "data": <TripResponse dict>}
+        format 结构化完成后发出，携带最终行程。
+
+    用 app.stream(stream_mode="values") 逐步拿到完整 state：每跑完一个节点
+    都会吐一份完整 state，借此在「推理完成」与「结构化完成」之间插入进度信号。
+    """
+    logger.info("plan_trip_stream 开始：city=%s, %s ~ %s",
+                request.city, request.start_date, request.end_date)
+
+    dates = _expand_dates(request)
+    logger.info("plan_trip_stream 行程共 %d 天", len(dates))
+
+    final_state: dict | None = None
+    emitted_formatting = False
+
+    # stream_mode="values"：每步产出完整累计 state（messages 已按 operator.add 合并）
+    for state in app.stream(_initial_state(request, dates), stream_mode="values"):
+        final_state = state
+        messages = state.get("messages") or []
+        last = messages[-1] if messages else None
+
+        # 推理完成（AI 消息且无 tool_calls）→ 下一步是 format，提前发进度信号
+        if not emitted_formatting and last is not None and _is_reasoning_done(last):
+            emitted_formatting = True
+            logger.info("plan_trip_stream：Agent 推理完成，发出『正在整理』进度信号")
+            yield {
+                "type": "progress",
+                "stage": "formatting",
+                "message": "规划已完成，正在整理行程…",
+            }
+
+    if final_state is None:
+        logger.error("plan_trip_stream：Graph 未产出任何 state")
+        raise RuntimeError("规划流程未产出结果")
+
+    resp = _finalize(final_state, request, dates)
+    yield {"type": "result", "data": resp.model_dump()}
