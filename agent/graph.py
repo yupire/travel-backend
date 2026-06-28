@@ -64,6 +64,20 @@ logger = logging.getLogger(__name__)
 # ──────────────────────── 条件边 ────────────────────────
 MAX_RETRY = 3
 
+# agent ↔ tools 主循环的软上限：一次完整规划里允许 LLM 发起工具调用的最大轮数。
+# 每轮 agent 可一次性并行发起多个 tool_calls，正常一两轮就能把景点/天气/交通等
+# 并行查完，8 轮足够覆盖「先查→看结果→补查→修正」的真实需求。达到上限后强制进入
+# format，用「已经拿到的数据」收尾，而不是无限循环或撞上 recursion_limit 直接报错。
+MAX_TOOL_ROUNDS = 8
+
+
+def _count_tool_rounds(messages: list) -> int:
+    """统计历史里 AI 发起过工具调用的轮数（含当前这条待执行的）。"""
+    return sum(
+        1 for m in messages
+        if getattr(m, "type", "") == "ai" and (getattr(m, "tool_calls", None) or [])
+    )
+
 
 def should_continue(state: TravelState) -> str:
     """agent 节点后的路由决策。
@@ -72,7 +86,7 @@ def should_continue(state: TravelState) -> str:
     - "tools"        → 调用工具
     - "agent"        → agent 自身异常，未超限时重试一次
     - "fallback"     → 异常 / 重试超限，走降级
-    - "format"       → LLM 不再调用工具，进入格式化节点产出严格 JSON
+    - "format"       → LLM 不再调用工具 / 工具轮数达上限，进入格式化节点产出严格 JSON
     """
     # 1) 重试次数超限：直接降级
     retry = state.get("retry_count", 0)
@@ -96,10 +110,18 @@ def should_continue(state: TravelState) -> str:
                        retry, MAX_RETRY)
         return "agent"
 
-    # 3) LLM 决定调用工具 → 走 tools 节点
+    # 3) LLM 决定调用工具 → 走 tools 节点；但先卡主循环软上限：工具轮数达上限时
+    #    不再执行新一轮工具，强制进入 format 用已收集数据收尾，避免无限循环/超慢。
     tool_calls = getattr(last, "tool_calls", None)
     if tool_calls:
-        logger.info("should_continue: LLM 请求 %d 个工具 -> tools", len(tool_calls))
+        rounds = _count_tool_rounds(messages)
+        if rounds > MAX_TOOL_ROUNDS:
+            logger.warning(
+                "should_continue: 工具调用轮数 %d 超过上限 %d -> 强制 format 收尾",
+                rounds, MAX_TOOL_ROUNDS)
+            return "format"
+        logger.info("should_continue: LLM 请求 %d 个工具（第 %d 轮）-> tools",
+                    len(tool_calls), rounds)
         return "tools"
 
     # 4) LLM 不再调用工具：进入 format 节点，用 JSON 模式把已收集数据整理成严格

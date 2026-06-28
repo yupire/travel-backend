@@ -94,6 +94,12 @@ def _is_failed_tool_message(message, content: str) -> bool:
     return False
 
 
+# 同一个工具跨轮失败到这个次数后就「放弃」：不再要求 LLM 修复重试，改为提示它跳过
+# 该数据 / 用合理默认值继续。挡住对本质拿不到的数据（如超出预报窗口的天气、不支持的
+# 城市）反复打同一个接口造成的死循环式重复调用。
+MAX_TOOL_FAIL = 2
+
+
 def tools_node(state: TravelState) -> dict:
     """节点 3：执行 LLM 请求的工具，并逐个打印「第几步调用了哪个工具函数」。
 
@@ -114,8 +120,10 @@ def tools_node(state: TravelState) -> dict:
     # 真正执行交给 prebuilt ToolNode
     result = _tool_node.invoke(state)
 
-    # ToolNode 返回 {"messages": [ToolMessage, ...]}，逐条记录工具产出
+    # ToolNode 返回 {"messages": [ToolMessage, ...]}，逐条记录工具产出。
+    # fail_counts 跨轮累计每个工具的失败次数（上一轮的计数从 state 取出来续累）。
     new_msgs = result.get("messages", []) if isinstance(result, dict) else []
+    fail_counts = dict(state.get("tool_fail_counts") or {})
     tool_errors: list[dict] = []
     for m in new_msgs:
         content = str(getattr(m, "content", ""))
@@ -124,26 +132,46 @@ def tools_node(state: TravelState) -> dict:
         logger.info("【第 %d 步】  └─ 工具 %s 返回：内容长度=%d，预览=%s",
                     step, name, len(content), preview)
         if _is_failed_tool_message(m, content):
-            tool_errors.append({"tool": name, "detail": content[:300]})
-            logger.warning("【第 %d 步】  ⚠ 工具 %s 调用失败：%s", step, name, content[:200])
+            fail_counts[name] = fail_counts.get(name, 0) + 1
+            tool_errors.append({
+                "tool": name,
+                "detail": content[:300],
+                "fails": fail_counts[name],
+            })
+            logger.warning("【第 %d 步】  ⚠ 工具 %s 调用失败（累计 %d 次）：%s",
+                           step, name, fail_counts[name], content[:200])
 
     out = dict(result) if isinstance(result, dict) else {"messages": new_msgs}
     out["step"] = step
     out["tool_errors"] = tool_errors
+    out["tool_fail_counts"] = fail_counts
 
-    # 把失败的工具调用「收集起来」，并以引导消息要求 LLM 先修复再继续，
-    # 避免在缺少关键数据（如天气）时直接进入最终行程输出。
+    # 把失败的工具调用按「累计失败次数」分流，再回灌一条引导消息：
+    # - retryable（< 阈值）：要求修正参数后重试，拿到数据前不要输出最终行程；
+    # - give_up（≥ 阈值）：明确告诉 LLM 别再重复调用，跳过该数据 / 用合理默认值继续，
+    #   避免对本质拿不到的数据反复打同一个接口造成死循环式重复调用。
     if tool_errors:
-        names = "、".join(sorted({e["tool"] for e in tool_errors}))
-        detail_lines = "\n".join(f"- {e['tool']}: {e['detail']}" for e in tool_errors)
-        out["messages"] = list(new_msgs) + [
-            HumanMessage(content=(
-                f"⚠ 上一步有 {len(tool_errors)} 个工具调用失败（{names}）：\n"
-                f"{detail_lines}\n\n"
-                "请先修复这些失败：检查并修正参数后重试，例如天气查询失败时换用城市名"
-                "或确认日期在预报窗口内。在成功拿到这些关键数据之前，不要直接输出最终行程 JSON。"
-            ))
-        ]
+        retryable = [e for e in tool_errors if e["fails"] < MAX_TOOL_FAIL]
+        give_up = [e for e in tool_errors if e["fails"] >= MAX_TOOL_FAIL]
+        sections: list[str] = []
+        if retryable:
+            names = "、".join(sorted({e["tool"] for e in retryable}))
+            detail_lines = "\n".join(f"- {e['tool']}: {e['detail']}" for e in retryable)
+            sections.append(
+                f"⚠ 以下 {len(retryable)} 个工具调用失败（{names}），请检查并修正参数后重试"
+                f"（例如天气查询失败时换用城市名或确认日期在预报窗口内）。在成功拿到这些"
+                f"关键数据之前，不要直接输出最终行程 JSON：\n{detail_lines}"
+            )
+        if give_up:
+            names = "、".join(sorted({e["tool"] for e in give_up}))
+            detail_lines = "\n".join(
+                f"- {e['tool']}（已失败 {e['fails']} 次）: {e['detail']}" for e in give_up
+            )
+            sections.append(
+                f"🛑 以下工具已多次失败（{names}），请不要再重复调用它们，改为跳过该部分"
+                f"数据或使用合理默认值，基于已经拿到的数据继续完成规划：\n{detail_lines}"
+            )
+        out["messages"] = list(new_msgs) + [HumanMessage(content="\n\n".join(sections))]
     return out
 
 

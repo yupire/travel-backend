@@ -25,6 +25,12 @@ from agent.progress import _describe_tool_call
 
 logger = logging.getLogger(__name__)
 
+# LangGraph 节点遍历的硬上限（默认 25）。真正控制循环规模的是 graph.should_continue 里
+# 的 MAX_TOOL_ROUNDS 软上限——正常应在这之前就强制收尾。这里给一个明显大于软上限路径
+# （8 轮 agent+tools≈16 + format 重试等）的值作为硬兜底，确保软上限先生效、不至于因撞上
+# 默认 25 抛 GraphRecursionError；万一逻辑异常导致失控，也会在 50 步处止血。
+_GRAPH_CONFIG = {"recursion_limit": 50}
+
 
 # ──────────────────────── 公共辅助 ────────────────────────
 def _expand_dates(request: TripRequest) -> list[str]:
@@ -54,6 +60,7 @@ def _initial_state(request: TripRequest, dates: list[str]) -> dict:
         "clusters": {},
         "daily_plans": [],
         "tool_errors": [],
+        "tool_fail_counts": {},
     }
 
 
@@ -99,7 +106,7 @@ def plan_trip(request: TripRequest) -> TripResponse:
     logger.info("plan_trip 行程共 %d 天", len(dates))
 
     # 同步触发整个 Graph：从 START -> agent，循环工具调用直到 reasoning/fallback
-    final_state = app.invoke(_initial_state(request, dates))
+    final_state = app.invoke(_initial_state(request, dates), config=_GRAPH_CONFIG)
 
     return _finalize(final_state, request, dates)
 
@@ -141,7 +148,8 @@ def _plan_events(request: TripRequest):
     }
 
     # stream_mode="values"：每步产出完整累计 state（messages 已按 operator.add 合并）
-    for state in app.stream(_initial_state(request, dates), stream_mode="values"):
+    for state in app.stream(_initial_state(request, dates), stream_mode="values",
+                            config=_GRAPH_CONFIG):
         final_state = state
         messages = state.get("messages") or []
         step = state.get("step", 0)

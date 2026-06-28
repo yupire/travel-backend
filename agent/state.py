@@ -20,6 +20,8 @@ class TravelState(TypedDict):
     - step: 全局步骤计数器，每进入一个节点 +1，用于日志里标注「第几步」
     - pois / weather / clusters / daily_plans: 工具调用的中间数据
     - tool_errors: 最近一次 tools_node 执行中失败的工具调用（供路由判定是否需先修复）
+    - tool_fail_counts: 按工具名跨轮累计的失败次数，用于「同一工具失败到阈值后放弃、
+      不再要求 LLM 修复重试」，避免对本质拿不到的数据反复打同一个接口
     - format_retry: format_node 因超时/异常失败的重试次数
     - format_done: format_node 是否已成功产出结构化 JSON（路由判定是否结束）
     """
@@ -35,5 +37,6 @@ class TravelState(TypedDict):
     clusters: dict
     daily_plans: list[dict]
     tool_errors: list[dict]
+    tool_fail_counts: dict
     format_retry: int
     format_done: bool
